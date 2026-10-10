@@ -294,6 +294,15 @@ static void tapView(UIView *view) {
 
 // ---------------- 主循环 ----------------
 static void tick(void) {
+    // 悬浮球懒创建：必须放在所有提前 return 之前（无条件创建），
+    // 否则默认关闭时 tick 直接 return，浮钮永远建不出来（鸡生蛋死锁）
+    if (!gOverlay) {
+        UIWindowScene *sc = nil;
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
+            if ([s isKindOfClass:[UIWindowScene class]]) { sc = (UIWindowScene *)s; break; }
+        createOverlay(sc);
+    }
+
     if (!gEnabled || gWorking || gBank.count == 0) return;
 
     // 题库热更新（每轮询检查一次外部文件，改了立即生效）
@@ -312,14 +321,6 @@ static void tick(void) {
         win = UIApplication.sharedApplication.keyWindow;
     }
     if (!win) return;
-
-    // 悬浮球懒创建（等 scene 就绪）
-    if (!gOverlay) {
-        UIWindowScene *sc = nil;
-        for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
-            if ([s isKindOfClass:[UIWindowScene class]]) { sc = (UIWindowScene *)s; break; }
-        createOverlay(sc);
-    }
 
     NSMutableString *all = [NSMutableString string];
     NSMutableArray *tappables = [NSMutableArray array];
