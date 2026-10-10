@@ -25,13 +25,13 @@ after-install::
 # 把最终 dylib 复制到 workflow 上传约定路径（.theos/obj/AutoAnswer.dylib）
 # Theos/ellekit 实际产物在 .theos/obj/<config>/<arch>/，upload-artifact 路径需是确定的文件名
 after-all::
-	@echo "[*] after-all 触发，THEOS_BUILD_DIR=$(THEOS_BUILD_DIR)"
-	@f=$$(find "$(THEOS_BUILD_DIR)/obj" -name '$(TWEAK_NAME).dylib' 2>/dev/null | head -1); \
+	@echo "[*] after-all 触发"
+	@f=$$(find ".theos/obj" -name '$(TWEAK_NAME).dylib' 2>/dev/null | head -1); \
 	echo "[*] 找到 dylib: $$f"; \
 	if [ -n "$$f" ]; then \
-		cp -f "$$f" "$(THEOS_BUILD_DIR)/obj/$(TWEAK_NAME).dylib"; \
-		echo "[*] 已复制到 $(THEOS_BUILD_DIR)/obj/$(TWEAK_NAME).dylib"; \
+		cp -f "$$f" ".theos/obj/$(TWEAK_NAME).dylib"; \
+		echo "[*] 已复制到 .theos/obj/$(TWEAK_NAME).dylib"; \
 	else \
-		echo "[!] 未找到 $(TWEAK_NAME).dylib，列出 obj 目录:"; \
-		find "$(THEOS_BUILD_DIR)/obj" -maxdepth 3 2>/dev/null || true; \
+		echo "[!] 未找到 $(TWEAK_NAME).dylib，列出 .theos:"; \
+		find ".theos" -maxdepth 4 2>/dev/null || true; \
 	fi
