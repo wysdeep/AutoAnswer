@@ -53,6 +53,7 @@ static UIButton *gToggleBtn = nil;
 
 // 可编辑题库（运行时热更新，无需重装 dylib）
 static NSString *gExternalPath = nil;   // app 沙盒 Documents/AutoAnswer_questions.json
+static NSString *gBundledPath = nil;    // 内置 questions.json（随 dylib 编译进 App）
 static NSDate   *gExternalMtime = nil;  // 外部题库最后加载时间
 
 static double rnd(double a, double b) {
@@ -123,6 +124,7 @@ static void loadBank(void) {
     NSBundle *b = [NSBundle bundleForClass:[AutoAnswerRes class]];
     NSString *path = [b pathForResource:@"questions" ofType:@"json"];
     if (!path) path = [[NSBundle mainBundle] pathForResource:@"questions" ofType:@"json"];
+    gBundledPath = path;
     if (path) {
         NSArray *arr = loadBankFromPath(path);
         if (arr) gBank = arr;
@@ -133,13 +135,57 @@ static void loadBank(void) {
     gExternalPath = [dir stringByAppendingPathComponent:@"AutoAnswer_questions.json"];
 }
 
+// 把一条题规范化成可比对的签名（用于去重，避免内置/外部重复）
+static NSString *entrySignature(id entry) {
+    if (![entry isKindOfClass:[NSDictionary class]]) return [entry description];
+    NSDictionary *e = (NSDictionary *)entry;
+    id a = e[@"a"] ?: @"";
+    NSString *aStr = [a isKindOfClass:[NSArray class]]
+        ? [[(NSArray *)a sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@","]
+        : [a description];
+    id kw = e[@"kw"] ?: @[];
+    NSString *kwStr = [kw isKindOfClass:[NSArray class]]
+        ? [[(NSArray *)kw sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@","]
+        : [kw description];
+    return [NSString stringWithFormat:@"%@|%@|%@", e[@"q"] ?: @"", aStr, kwStr];
+}
+
+// 【自动导入】把内置 questions.json 的新题自动合并进外部可编辑文件：
+// - 外部文件不存在时，直接用内置题库生成它；
+// - 外部已有时，把内置里「外部没有」的题补进去，外部你自己加的题不会被覆盖。
+// 这样日常加题 = 在电脑上改内置 questions.json → 重跑构建 → 重装，新题自动生效，无需进 Filza。
+static void mergeBundledIntoExternal(void) {
+    if (!gBundledPath || !gExternalPath) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *bundled = loadBankFromPath(gBundledPath);
+    if (!bundled) return;
+    NSArray *ext = loadBankFromPath(gExternalPath) ?: @[];
+    NSMutableSet *have = [NSMutableSet set];
+    for (id e in ext) [have addObject:entrySignature(e)];
+    NSMutableArray *merged = [NSMutableArray arrayWithArray:ext];
+    for (id e in bundled) {
+        NSString *s = entrySignature(e);
+        if (![have containsObject:s]) { [merged addObject:e]; [have addObject:s]; }
+    }
+    if (merged.count > ext.count) {
+        NSData *d = [NSJSONSerialization dataWithJSONObject:merged
+                                                    options:NSJSONWritingPrettyPrinted
+                                                      error:nil];
+        if (d && [d writeToFile:gExternalPath atomically:YES]) {
+            gExternalMtime = [fm attributesOfItemAtPath:gExternalPath error:nil][NSFileModificationDate];
+            NSLog(@"[AutoAnswer] 已自动导入内置新题，现共 %lu 条（外部原有 %lu 条保留）",
+                  (unsigned long)merged.count, (unsigned long)ext.count);
+        }
+    }
+}
+
 // 题库热更新：外部文件优先于内置；改了文件下一次轮询（0.2s）自动生效，无需重装 dylib
 static void reloadBankIfNeeded(void) {
     if (!gExternalPath) return;
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL exists = [fm fileExistsAtPath:gExternalPath];
     if (!exists) {
-        // 首次：把内置题库复制出来，作为你之后可随时编辑的文件（见 README「加题库」）
+        // 首次：先把内置题库写成外部可编辑文件（见 README「加题库」）
         NSArray *base = gBank ?: @[];
         NSData *d = [NSJSONSerialization dataWithJSONObject:base
                                                     options:NSJSONWritingPrettyPrinted
@@ -147,10 +193,12 @@ static void reloadBankIfNeeded(void) {
         if (d && [d writeToFile:gExternalPath atomically:YES]) {
             NSDictionary *attr = [fm attributesOfItemAtPath:gExternalPath error:nil];
             gExternalMtime = attr[NSFileModificationDate];
-            NSLog(@"[AutoAnswer] 已生成可编辑题库（照这个格式加题即可）：%@", gExternalPath);
+            NSLog(@"[AutoAnswer] 已生成可编辑题库：%@", gExternalPath);
         }
         return;
     }
+    // 内置题库可能比外部新（重装了新版 dylib 或重跑构建）→ 自动合并新题
+    mergeBundledIntoExternal();
     NSDictionary *attr = [fm attributesOfItemAtPath:gExternalPath error:nil];
     NSDate *mtime = attr[NSFileModificationDate];
     if (!gExternalMtime || [mtime compare:gExternalMtime] == NSOrderedDescending) {
