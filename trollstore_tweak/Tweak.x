@@ -18,6 +18,7 @@
 
 #pragma clang diagnostic ignored "-Wundeclared-selector"
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 // ---------------- 配置：模拟手速（防风控） ----------------
 static const double kReadingMin   = 0.10; // 看题最短（秒）——抢红包要快
@@ -61,6 +62,7 @@ static double rnd(double a, double b) {
 static void updateToggleUI(void);
 
 // ---------------- 悬浮开关按钮 ----------------
+@interface AutoAnswerBundle : NSObject @end
 @implementation AutoAnswerBundle
 + (void)toggleTapped {
     gEnabled = !gEnabled;
@@ -271,8 +273,10 @@ static void tapView(UIView *view) {
     }
     for (UIGestureRecognizer *g in view.gestureRecognizers) {
         if ([g isKindOfClass:[UITapGestureRecognizer class]]) {
-            id target = [g valueForKey:@"_target"];
-            SEL action = (SEL)[g valueForKey:@"_action"];
+            id target = nil;
+            SEL action = NULL;
+            object_getInstanceVariable(g, "_target", (void **)&target);
+            object_getInstanceVariable(g, "_action", (void **)&action);
             if (target && action) {
                 ((void(*)(id, SEL, id))objc_msgSend)(target, action, g);
                 return;
