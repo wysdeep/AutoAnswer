@@ -1,0 +1,7 @@
+# TrollStore / TrollFools 注入过滤器：仅在淘宝 App 进程内加载本插件
+# 李佳琦答题在「手机淘宝 / 点淘」直播间弹出，目标 App 即淘宝。
+# 淘宝主 App Bundle ID 一般为 com.taobao.taobao（旧版 com.taobao.taobao4iPhone）。
+# 请在本机用 FLEX/AppInfo 确认后修改。
+Filter = {
+    Bundles = ( "com.taobao.taobao", "com.taobao.taobao4iPhone" );
+};
