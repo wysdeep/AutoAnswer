@@ -273,10 +273,13 @@ static void tapView(UIView *view) {
     }
     for (UIGestureRecognizer *g in view.gestureRecognizers) {
         if ([g isKindOfClass:[UITapGestureRecognizer class]]) {
-            id target = nil;
+            id target = [g valueForKey:@"_target"];
             SEL action = NULL;
-            object_getInstanceVariable(g, "_target", (void **)&target);
-            object_getInstanceVariable(g, "_action", (void **)&action);
+            Ivar aIvar = class_getInstanceVariable(object_getClass(g), "_action");
+            if (aIvar) {
+                uintptr_t *pp = (uintptr_t *)((uintptr_t)(__bridge void *)g + ivar_getOffset(aIvar));
+                action = (SEL)(*pp);
+            }
             if (target && action) {
                 ((void(*)(id, SEL, id))objc_msgSend)(target, action, g);
                 return;
