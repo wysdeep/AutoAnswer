@@ -356,37 +356,51 @@ static void tick(void) {
     // 题库热更新（每轮询检查一次外部文件，改了立即生效）
     reloadBankIfNeeded();
 
-    UIWindow *win = nil;
+    // 收集前台场景里【所有 window】的文字与可点目标（答题浮层可能在非 keyWindow）
+    NSMutableString *all = [NSMutableString string];
+    NSMutableArray *tappables = [NSMutableArray array];
     if (@available(iOS 13.0, *)) {
         for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
             if ([s isKindOfClass:[UIWindowScene class]] &&
                 ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
                 for (UIWindow *w in ((UIWindowScene *)s).windows)
-                    if (w.isKeyWindow) { win = w; break; }
+                    if (!w.isHidden && w.alpha > 0.01) collectViews(w, all, tappables);
             }
         }
     } else {
-        win = UIApplication.sharedApplication.keyWindow;
+        collectViews(UIApplication.sharedApplication.keyWindow, all, tappables);
     }
-    if (!win) return;
-
-    NSMutableString *all = [NSMutableString string];
-    NSMutableArray *tappables = [NSMutableArray array];
-    collectViews(win, all, tappables);
     if (all.length < 2) return;
 
+    NSArray *answers = matchAnswers(all);
+    NSArray *allAbove = findAllAboveTappables(tappables);
+
     NSString *qkey = questionKey(all);
-    if (!qkey) return;                       // 屏上没有题目，不动作
+    if (!qkey) {
+        // 屏上没问号：只要题库命中或遇到「以上都是」，仍视为有题，用答案串作题key兜底去重
+        if (answers.count || allAbove.count)
+            qkey = [NSString stringWithFormat:@"A:%@|AB:%lu",
+                    [answers componentsJoinedByString:@","], (unsigned long)allAbove.count];
+        else
+            return;                           // 屏上既无问号也无命中，不动作
+    }
     if (![qkey isEqualToString:gLastKey]) {  // 换题了，重置已点记录
         gLastKey = qkey;
         [gDoneQ removeAllObjects];
     }
     if ([gDoneQ containsObject:qkey]) return; // 这道题已经处理过，不重复点（防重复提交）
 
-    // === 新特性①：屏幕出现「以上都是」则默认必选 ===
-    NSArray *allAbove = findAllAboveTappables(tappables);
+    // 诊断日志（开启时每 2 秒一条）：看清插件读到了什么、命中了几条
+    static NSDate *gLastDiag = nil;
+    NSDate *now = [NSDate date];
+    if (!gLastDiag || [now timeIntervalSinceDate:gLastDiag] > 2.0) {
+        gLastDiag = now;
+        NSLog(@"[AutoAnswer][诊断] 屏上文字 %lu 字符 / 可点项 %lu 个 / 命中答案 %lu 条 / 以上都是 %lu 项",
+              (unsigned long)all.length, (unsigned long)tappables.count,
+              (unsigned long)answers.count, (unsigned long)allAbove.count);
+    }
 
-    NSArray *answers = matchAnswers(all);
+    // === 新特性①：屏幕出现「以上都是」则默认必选 ===
 
     NSMutableArray *optViews = [NSMutableArray array];
     NSMutableArray *optTexts = [NSMutableArray array];
