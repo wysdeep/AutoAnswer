@@ -1,0 +1,31 @@
+name: Build AutoAnswer dylib (云端，无需 Mac)
+
+# 触发：① 手动在 Actions 页点 "Run workflow"；② 推送到 main/master 自动跑
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Theos + ellekit（云端 macOS）
+        uses: Randomblock1/theos-action@v1
+
+      - name: 编译 tweak
+        working-directory: trollstore_tweak
+        run: |
+          make clean
+          make
+
+      - name: 上传产物（dylib + 题库）
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoAnswer-dylib
+          path: |
+            trollstore_tweak/.theos/obj/AutoAnswer.dylib
+            trollstore_tweak/questions.json
