@@ -21,3 +21,11 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 
 after-install::
 	@echo "[*] dylib 已生成，请用 TrollFools 注入目标 App"
+
+# 把最终 dylib 复制到 workflow 上传约定路径（.theos/obj/AutoAnswer.dylib）
+# Theos/ellekit 实际产物在 .theos/obj/debug/arm64/，upload-artifact 路径需是确定的文件名
+after-all::
+	@for f in $$(find "$(THEOS_BUILD_DIR)/obj" -name '$(TWEAK_NAME).dylib' 2>/dev/null); do \
+		cp "$$f" "$(THEOS_BUILD_DIR)/obj/$(TWEAK_NAME).dylib"; \
+		echo "[*] 复制产物 -> $(THEOS_BUILD_DIR)/obj/$(TWEAK_NAME).dylib"; \
+	done
