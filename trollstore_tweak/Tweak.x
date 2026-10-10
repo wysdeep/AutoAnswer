@@ -60,6 +60,23 @@ static double rnd(double a, double b) {
     return a + ((double)arc4random_uniform(10000) / 10000.0) * (b - a);
 }
 
+// ---------------- 文件日志（方便用 Filza 查看，无需 Mac/syslog） ----------------
+static NSString *aaLogPath(void) {
+    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return [docs.firstObject stringByAppendingPathComponent:@"AutoAnswer_log.txt"];
+}
+static void aaLog(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSLog(@"[AutoAnswer] %@", msg);
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
+    NSString *p = aaLogPath();
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+    if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+    else    { [line writeToFile:p atomically:YES]; }
+}
+
 static void updateToggleUI(void);
 
 // ---------------- 悬浮开关按钮 ----------------
@@ -68,7 +85,7 @@ static void updateToggleUI(void);
 + (void)toggleTapped {
     gEnabled = !gEnabled;
     updateToggleUI();
-    NSLog(@"[AutoAnswer] 手动开关 → %@", gEnabled ? @"开" : @"关");
+    aaLog(@"手动开关 → %@", gEnabled ? @"开" : @"关");
 }
 @end
 
@@ -173,7 +190,7 @@ static void mergeBundledIntoExternal(void) {
                                                       error:nil];
         if (d && [d writeToFile:gExternalPath atomically:YES]) {
             gExternalMtime = [fm attributesOfItemAtPath:gExternalPath error:nil][NSFileModificationDate];
-            NSLog(@"[AutoAnswer] 已自动导入内置新题，现共 %lu 条（外部原有 %lu 条保留）",
+            aaLog(@"已自动导入内置新题，现共 %lu 条（外部原有 %lu 条保留）",
                   (unsigned long)merged.count, (unsigned long)ext.count);
         }
     }
@@ -193,7 +210,7 @@ static void reloadBankIfNeeded(void) {
         if (d && [d writeToFile:gExternalPath atomically:YES]) {
             NSDictionary *attr = [fm attributesOfItemAtPath:gExternalPath error:nil];
             gExternalMtime = attr[NSFileModificationDate];
-            NSLog(@"[AutoAnswer] 已生成可编辑题库：%@", gExternalPath);
+            aaLog(@"已生成可编辑题库：%@", gExternalPath);
         }
         return;
     }
@@ -206,7 +223,7 @@ static void reloadBankIfNeeded(void) {
         if (ext) {
             gBank = ext;
             gExternalMtime = mtime;
-            NSLog(@"[AutoAnswer] 题库热更新生效：%lu 条", (unsigned long)gBank.count);
+            aaLog(@"题库热更新生效：%lu 条", (unsigned long)gBank.count);
         }
     }
 }
@@ -390,12 +407,12 @@ static void tick(void) {
     }
     if ([gDoneQ containsObject:qkey]) return; // 这道题已经处理过，不重复点（防重复提交）
 
-    // 诊断日志（开启时每 2 秒一条）：看清插件读到了什么、命中了几条
+    // 诊断日志（开启时每 2 秒一条，写文件）：看清插件读到了什么、命中了几条
     static NSDate *gLastDiag = nil;
     NSDate *now = [NSDate date];
     if (!gLastDiag || [now timeIntervalSinceDate:gLastDiag] > 2.0) {
         gLastDiag = now;
-        NSLog(@"[AutoAnswer][诊断] 屏上文字 %lu 字符 / 可点项 %lu 个 / 命中答案 %lu 条 / 以上都是 %lu 项",
+        aaLog(@"[诊断] 屏上文字 %lu 字符 / 可点项 %lu 个 / 命中答案 %lu 条 / 以上都是 %lu 项",
               (unsigned long)all.length, (unsigned long)tappables.count,
               (unsigned long)answers.count, (unsigned long)allAbove.count);
     }
@@ -413,7 +430,7 @@ static void tick(void) {
                 [optTexts addObject:p[0]];
             }
         }
-        NSLog(@"[AutoAnswer] 命中「以上都是」默认必选，共 %lu 项", (unsigned long)optViews.count);
+        aaLog(@"命中「以上都是」默认必选，共 %lu 项", (unsigned long)optViews.count);
     } else {
         if (!answers.count || answers.count > 4) return;
         for (NSString *ans in answers) {
@@ -436,7 +453,7 @@ static void tick(void) {
     gWorking = YES;
     [gDoneQ addObject:qkey];
     double reading = rnd(kReadingMin, kReadingMax);
-    NSLog(@"[AutoAnswer] 命中 %@，看题 %.1fs", optTexts, reading);
+    aaLog(@"命中 %@，看题 %.1fs", optTexts, reading);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(reading * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -448,7 +465,7 @@ static void tick(void) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(offset * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 tapView(v);
-                NSLog(@"[AutoAnswer] 已选：%@", txt);
+                aaLog(@"已选：%@", txt);
             });
         }
         double confirmAt = offset + rnd(kConfirmMin, kConfirmMax);
@@ -456,9 +473,9 @@ static void tick(void) {
                        dispatch_get_main_queue(), ^{
             if (confirm) {
                 tapView(confirm);
-                NSLog(@"[AutoAnswer] 已点「确认提交」");
+                aaLog(@"已点「确认提交」");
             } else {
-                NSLog(@"[AutoAnswer] 未找到确认按钮，跳过提交");
+                aaLog(@"未找到确认按钮，跳过提交");
             }
             gWorking = NO;
         });
@@ -466,6 +483,7 @@ static void tick(void) {
 }
 
 %ctor {
+    @try { [[NSFileManager defaultManager] removeItemAtPath:aaLogPath() error:nil]; } @catch (...) {}
     loadBank();
     reloadBankIfNeeded();   // 首次启动把内置题库复制成可编辑文件，方便你随时加题
     gDoneQ = [NSMutableSet set];
@@ -473,6 +491,6 @@ static void tick(void) {
     [NSTimer scheduledTimerWithTimeInterval:0.2
                                     repeats:YES
                                       block:^(NSTimer *t){ tick(); }];
-    NSLog(@"[AutoAnswer] 插件已加载，内置题库 %lu 条\n可编辑题库路径：%@\n默认关闭（点悬浮球开启）",
+    aaLog(@"插件已加载，内置题库 %lu 条\n可编辑题库路径：%@\n默认关闭（点悬浮球开启）",
           (unsigned long)(gBank ? gBank.count : 0), gExternalPath);
 }
