@@ -228,6 +228,7 @@ static void collectViews(UIView *view, NSMutableString *allTexts, NSMutableArray
     NSString *t = nil;
     if ([view isKindOfClass:[UILabel class]])         t = [(UILabel *)view text];
     else if ([view isKindOfClass:[UITextView class]]) t = [(UITextView *)view text];
+    else if ([view isKindOfClass:[UIButton class]])   t = [(UIButton *)view titleForState:UIControlStateNormal];
     else if ([view respondsToSelector:@selector(text)]) {
         id x = [view performSelector:@selector(text)];
         if ([x isKindOfClass:[NSString class]]) t = x;
@@ -564,6 +565,30 @@ static void tick(void) {
                                     CGRectGetMinX(f), CGRectGetMinY(f)]];
                 }
                 aaLog(@"[诊断] 确认钮上方可点项dump：%@", dbg);
+            }
+            if (hasQuiz && !confirm) {
+                static NSDate *gLastDiag3 = nil;
+                if (!gLastDiag3 || [now timeIntervalSinceDate:gLastDiag3] > 6.0) {
+                    gLastDiag3 = now;
+                    // 有答题语境但没找到确认钮 → 列出屏上所有可点文字 + 含关键词文字，定位确认钮/弹窗是否真在
+                    NSMutableArray *tps = [NSMutableArray array];
+                    for (NSArray *p in tappables) {
+                        if (p.count < 3) continue;
+                        if (tps.count >= 14) break;
+                        [tps addObject:p[0]];
+                    }
+                    aaLog(@"[诊断] 有题但无确认钮 → 可点文字抽样：%@", tps);
+                    NSMutableArray *kws = [NSMutableArray array];
+                    NSArray *keys = @[@"确认",@"提交",@"答题",@"红包",@"剩余",@"选择",@"选项",
+                                      @"我知道",@"知道了",@"确定",@"交卷",@"抢答"];
+                    for (NSArray *p in textFrames) {
+                        if (p.count < 3) continue;
+                        NSString *tt = p[0];
+                        for (NSString *k in keys) if ([tt containsString:k]) { [kws addObject:tt]; break; }
+                        if (kws.count >= 14) break;
+                    }
+                    aaLog(@"[诊断] 含关键词文字：%@", kws);
+                }
             }
             if (all.length < 2) {
                 if (gWebViewCount > 0) {
