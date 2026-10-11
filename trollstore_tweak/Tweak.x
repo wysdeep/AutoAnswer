@@ -262,6 +262,35 @@ static void collectViews(UIView *view, NSMutableString *allTexts, NSMutableArray
     for (UIView *c in view.subviews) collectViews(c, allTexts, tappables);
 }
 
+// ---------------- 网页视图检测（诊断用） ----------------
+// 若原生读不到文字但屏上有 WebView，则答题界面很可能是网页渲染，原生 UILabel 读不到。
+static NSInteger gWebViewCount = 0;
+static void scanWebViews(UIView *v) {
+    if (!v) return;
+    Class wk  = NSClassFromString(@"WKWebView");
+    Class uiw = NSClassFromString(@"UIWebView");
+    if ((wk  && [v isKindOfClass:wk])  || (uiw && [v isKindOfClass:uiw])) gWebViewCount++;
+    for (UIView *c in v.subviews) scanWebViews(c);
+}
+// 当原生读不到文字且屏上有 WebView 时，尝试用 JS 读 DOM 文字（只读，不点），验证「WebView 读取方案」可行性
+static void tryReadWebViewDOM(UIView *v) {
+    if (!v) return;
+    Class wk = NSClassFromString(@"WKWebView");
+    if (wk && [v isKindOfClass:wk]) {
+        SEL sel = NSSelectorFromString(@"evaluateJavaScript:completionHandler:");
+        if ([v respondsToSelector:sel]) {
+            NSString *js = @"(function(){var t=document.body?document.body.innerText:'';if(!t&&document.documentElement)t=document.documentElement.innerText;return (t||'').slice(0,300);})()";
+            void(^h)(id,id) = ^(id res, id err){
+                NSString *txt = [res isKindOfClass:[NSString class]] ? res : [res description];
+                aaLog(@"[诊断-WK] DOM可读=%@ 文字:%@", err?@"否":@"是",
+                      [txt length]>200?[[txt substringToIndex:200]stringByAppendingString:@"..."]:txt);
+            };
+            ((void(*)(id,SEL,id,id))objc_msgSend)(v, sel, js, h);
+        }
+    }
+    for (UIView *c in v.subviews) tryReadWebViewDOM(c);
+}
+
 // ---------------- 题库匹配（答案必须出现在界面 + 关键词命中） ----------------
 // 返回需要点击的选项文字数组（多选返回多个）
 static NSArray<NSString *> *matchAnswers(NSString *combined) {
@@ -409,7 +438,7 @@ static void tick(void) {
         createOverlay(sc);
     }
 
-    if (!gEnabled || gWorking || gBank.count == 0) return;
+    if (!gEnabled || gWorking) return;
 
     // 题库热更新（每轮询检查一次外部文件，改了立即生效）
     reloadBankIfNeeded();
@@ -428,7 +457,22 @@ static void tick(void) {
     } else {
         collectViews(UIApplication.sharedApplication.keyWindow, all, tappables);
     }
-    // 诊断日志（开启时每 2 秒一条，无条件必打）：屏上文字 0 字符 → 多半是答题界面用网页/画布渲染，读不到原生文字
+
+    // 统计屏上网页视图数量（诊断：用来判断答题界面是不是 WebView 渲染）
+    gWebViewCount = 0;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]] &&
+                ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
+                for (UIWindow *w in ((UIWindowScene *)s).windows)
+                    if (!w.isHidden && w.alpha > 0.01) scanWebViews(w);
+            }
+        }
+    } else {
+        scanWebViews(UIApplication.sharedApplication.keyWindow);
+    }
+
+    // 诊断日志（开启时每 2 秒一条，无条件必打）
     {
         static NSDate *gLastDiag2 = nil;
         NSDate *now = [NSDate date];
@@ -437,9 +481,28 @@ static void tick(void) {
             BOOL hasQ = NO;
             for (NSString *ln in [all componentsSeparatedByString:@"\n"])
                 if ([ln containsString:@"？"] || [ln containsString:@"?"]) { hasQ = YES; break; }
-            aaLog(@"[诊断] 屏上文字 %lu 字符 / 可点项 %lu 个 / 有问号=%@%@",
-                  (unsigned long)all.length, (unsigned long)tappables.count, hasQ?@"是":@"否",
-                  all.length < 2 ? @"（读不到文字→可能答题界面是网页/画布渲染，插件无法作答）":@"");
+            aaLog(@"[诊断] 浮钮=%@ 开关=%@ 原生文字 %lu 字符 / 可点 %lu / 网页视图 %ld / 有问号=%@",
+                  gOverlay?@"有":@"无", gEnabled?@"开":@"关",
+                  (unsigned long)all.length, (unsigned long)tappables.count,
+                  (long)gWebViewCount, hasQ?@"是":@"否");
+            if (all.length < 2) {
+                if (gWebViewCount > 0) {
+                    aaLog(@"[诊断] 原生读不到文字但屏上有 %ld 个网页视图 → 强烈怀疑答题界面是网页(WebView)渲染，原生 UILabel 读不到；下面尝试用 JS 读 DOM",
+                          (long)gWebViewCount);
+                    if (@available(iOS 13.0, *)) {
+                        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+                            if (((UIWindowScene *)s).activationState != UISceneActivationStateForegroundActive) continue;
+                            for (UIWindow *w in ((UIWindowScene *)s).windows)
+                                if (!w.isHidden && w.alpha > 0.01) tryReadWebViewDOM(w);
+                        }
+                    } else {
+                        tryReadWebViewDOM(UIApplication.sharedApplication.keyWindow);
+                    }
+                } else {
+                    aaLog(@"[诊断] 原生读不到文字且无网页视图 → 可能：不是淘宝主App / dylib 未注入 / 答题页不在前台 / 开关没开");
+                }
+            }
         }
     }
 
