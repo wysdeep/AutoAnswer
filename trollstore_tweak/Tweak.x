@@ -382,7 +382,7 @@ static void tapView(UIView *view) {
             Ivar aIvar = class_getInstanceVariable(object_getClass(g), "_action");
             if (aIvar) {
                 // 用 object_getIvar 安全取值，避免手动算偏移解引用野指针
-                action = (SEL)object_getIvar(g, aIvar);
+                action = (SEL)(__bridge void *)object_getIvar(g, aIvar);
             }
             if (target && action && [target respondsToSelector:action]) {
                 ((void(*)(id,SEL,id))objc_msgSend)(target, action, g);
