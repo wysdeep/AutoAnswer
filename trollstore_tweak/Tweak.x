@@ -20,6 +20,7 @@
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 #include <substrate.h>
 
@@ -430,6 +431,82 @@ static void retrySubmitIfBusy(UIView *confirm, NSInteger left) {
     }
 }
 
+// ---------------- WebView(H5) 答题弹窗探测与作答 ----------------
+// 日志已证实：答题抢红包弹窗是 H5(WebView) 渲染，原生 UILabel/UIButton 读不到其按钮与选项。
+// 这里安全读取可见且已加载完成的 WKWebView 的 DOM，识别选项并点击、点"确认提交"。
+static void collectWebViews(UIView *v, NSMutableArray *out) {
+    if (!v) return;
+    Class wk = NSClassFromString(@"WKWebView");
+    if (wk && [v isKindOfClass:wk]) {
+        WKWebView *wv = (WKWebView *)v;
+        if (!wv.isLoading && !wv.hidden && wv.alpha > 0.01 && wv.window) [out addObject:wv];
+    }
+    for (UIView *c in v.subviews) collectWebViews(c, out);
+}
+
+static void webViewRunJS(WKWebView *wv, NSString *js, void (^cb)(NSString *)) {
+    @try {
+        if (!wv || wv.isLoading || !wv.window) { if (cb) cb(nil); return; }
+        [wv evaluateJavaScript:js completionHandler:^(id res, NSError *err){
+            if (err) { if (cb) cb(nil); return; }
+            if (cb) cb(res ? [NSString stringWithFormat:@"%@", res] : @"");
+        }];
+    } @catch (NSException *e) {
+        if (cb) cb(nil);
+    }
+}
+
+static void tryWebViewQuiz(void) {
+    @try {
+        static NSDate *gLastWeb = nil;
+        NSDate *now = [NSDate date];
+        if (gLastWeb && [now timeIntervalSinceDate:gLastWeb] < 0.6) return;  // 节流，避免狂刷
+        gLastWeb = now;
+
+        NSMutableArray *wvs = [NSMutableArray array];
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]] &&
+                    ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
+                    for (UIWindow *w in ((UIWindowScene *)s).windows)
+                        if (!w.isHidden && w.alpha > 0.01) collectWebViews(w, wvs);
+                }
+            }
+        }
+        if (wvs.count == 0) return;
+
+        for (WKWebView *wv in wvs) {
+            // 先读 DOM 文字，判断是否答题弹窗
+            webViewRunJS(wv, @"document.body.innerText", ^(NSString *txt){
+                if (!txt) return;
+                BOOL isQuiz = ([txt containsString:@"确认提交"] || [txt containsString:@"提交答案"] ||
+                              ([txt containsString:@"答题"] && [txt containsString:@"剩余"]));
+                if (!isQuiz) return;
+                aaLog(@"[H5答题] 检测到答题弹窗！DOM文字(截断400)：%@",
+                      [txt length] > 400 ? [txt substringToIndex:400] : txt);
+                // 选选项（短文字、可点、非提交/关闭类）+ 点提交，返回 JSON 摘要
+                NSString *js =
+                @"(function(){"
+                 "var all=[].slice.call(document.querySelectorAll('*'));"
+                 "var clickable=all.filter(function(e){var t=(e.innerText||e.textContent||'').trim();"
+                 "return t.length>=1&&t.length<=40&&(e.tagName==='BUTTON'||e.getAttribute('role')==='button'||e.onclick);});"
+                 "var nonSub=/确认提交|提交答案|交卷|提交|知道了|关闭|取消|下一题|跳过|换一换|返回|首页/;"
+                 "var opts=clickable.filter(function(e){return !nonSub.test(e.innerText||e.textContent||'');});"
+                 "var clicked=[];opts.slice(0,8).forEach(function(e){try{e.click();clicked.push((e.innerText||'').trim());}catch(_){}});"
+                 "var btn=clickable.find(function(e){var t=(e.innerText||e.textContent||'');return /确认提交|提交答案|交卷|提交/.test(t)&&t.length<=12;});"
+                 "var sub=btn?(function(){try{btn.click();return 'clicked:'+(btn.innerText||'');}catch(_){return 'err';}})():'no-submit';"
+                 "return JSON.stringify({opts:clicked,submit:sub});"
+                 "})()";
+                webViewRunJS(wv, js, ^(NSString *r){
+                    aaLog(@"[H5答题] 作答结果：%@", r ? r : @"JS无返回");
+                });
+            });
+        }
+    } @catch (NSException *e) {
+        aaLog(@"[异常] tryWebViewQuiz：%@", e);
+    }
+}
+
 // ---------------- 主循环 ----------------
 static void tick(void) {
     if (!gOverlay) {
@@ -478,15 +555,16 @@ static void tick(void) {
             if (p.count >= 3 && p[1] == confirm) { confirmText = p[0]; break; }
     }
 
-    // ===== 答题语境判定：必须出现「答题/红包/剩余/抢答」等字样，才认为在答题弹窗 =====
-    // 否则屏上大量直播间弹幕/聊天会被误当选项（日志已证实旧版因此乱答聊天）
+    // ===== 答题语境判定：必须出现强信号字样，才认为在答题弹窗 =====
+    // 注意：悬浮球按钮自身显示「答题 开」含"答题"二字 → 不能只用"答题"当信号，否则恒为真（假阳性）
+    // 这里只用答题弹窗专属词：答题抢红包 / 答题时间 / 剩余(倒计时) / 抢答 / 答题玩法
     BOOL hasQuiz = NO;
     for (NSArray *p in textFrames) {
         if (p.count < 3) continue;
         NSString *tt = p[0];
-        if ([tt containsString:@"答题"] || [tt containsString:@"红包"] ||
+        if ([tt containsString:@"答题抢红包"] || [tt containsString:@"答题时间"] ||
             [tt containsString:@"剩余"] || [tt containsString:@"抢答"] ||
-            [tt containsString:@"答题时间"] || [tt containsString:@"倒计时"]) { hasQuiz = YES; break; }
+            [tt containsString:@"倒计时"] || [tt containsString:@"答题玩法"]) { hasQuiz = YES; break; }
     }
 
     // 选项候选：确认按钮上方 520pt 内、同窗口、文字 ≤ 40 字
@@ -599,6 +677,11 @@ static void tick(void) {
                 }
             }
         }
+    }
+
+    // 原生没找到确认钮（答题弹窗是 H5/WebView） → 走 WebView 方案
+    if (!confirm && !gWorking) {
+        tryWebViewQuiz();
     }
 
     if (!hasQuiz || !confirm || options.count < 2) return;
@@ -752,6 +835,6 @@ static void tick(void) {
     [NSTimer scheduledTimerWithTimeInterval:0.2
                                     repeats:YES
                                       block:^(NSTimer *t){ tick(); }];
-    aaLog(@"插件已加载（反向识别版），内置题库 %lu 条\n默认关闭（点悬浮球开启）",
+    aaLog(@"插件已加载（反向识别+WebView H5方案），内置题库 %lu 条\n默认关闭（点悬浮球开启）",
           (unsigned long)(gBank ? gBank.count : 0));
 }
