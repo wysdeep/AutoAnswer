@@ -471,8 +471,8 @@ static void tick(void) {
             if (gToggleBtn && v == gToggleBtn) continue;
             if (cw && v.window != cw) continue;                 // 必须与确认按钮同窗口
             CGRect f = [(NSValue *)p[2] CGRectValue];
-            if (f.maxY > confirmFrame.minY + 4) continue;       // 必须在确认按钮上方
-            if (f.minY < confirmFrame.minY - 520) continue;     // 必须在弹窗区域内
+            if (CGRectGetMaxY(f) > CGRectGetMinY(confirmFrame) + 4) continue;       // 必须在确认按钮上方
+            if (CGRectGetMinY(f) < CGRectGetMinY(confirmFrame) - 520) continue;     // 必须在弹窗区域内
             NSString *t = p[0];
             if (t.length == 0 || t.length > 40) continue;       // 排除商品卡等超长文本
             BOOL skip = NO;
@@ -488,7 +488,7 @@ static void tick(void) {
         CGFloat optionsMinY = CGFLOAT_MAX;
         for (NSArray *p in options) {
             CGRect f = [(NSValue *)p[2] CGRectValue];
-            if (f.minY < optionsMinY) optionsMinY = f.minY;
+            if (CGRectGetMinY(f) < optionsMinY) optionsMinY = CGRectGetMinY(f);
         }
         UIWindow *cw = confirm.window;
         for (NSArray *p in textFrames) {
@@ -501,8 +501,8 @@ static void tick(void) {
             if ([t containsString:@"答题抢红包"] || [t containsString:@"已结束"] ||
                 [t containsString:@"超时"]   || [t containsString:@"红包"]) continue;
             CGRect f = [(NSValue *)p[1] CGRectValue];
-            if (f.maxY > optionsMinY + 4) continue;             // 必须在所有选项上方
-            if (f.maxY < optionsMinY - 260) continue;           // 且不能太远（排除屏顶横幅）
+            if (CGRectGetMaxY(f) > optionsMinY + 4) continue;             // 必须在所有选项上方
+            if (CGRectGetMaxY(f) < optionsMinY - 260) continue;           // 且不能太远（排除屏顶横幅）
             if (t.length > qText.length) qText = t;
         }
     }
