@@ -2,8 +2,10 @@
 //
 // 功能：
 //   1. 悬浮球手动开关（默认关，点一下切换 开/关）——由你控制时机
-//   2. 区域化识别：先找「提交/我知道了/确定」确认按钮定位答题弹窗，
-//      只在弹窗区域内找题干和选项（避免误点直播间其他按钮/商品卡/评论）
+//   2. 反向识别：先找出屏上所有「可点载体」（UIControl 或带点按手势的视图，不限层级深度），
+//      再看每个载体框住了哪些文字 → 得到「文字+可点目标」对。
+//      确认按钮（提交/确认/我知道了/确定…）为锚点定位答题弹窗，
+//      只在弹窗区域内（确认按钮上方、同窗口）找题干和选项。
 //   3. 题干不要求带问号（"…分为几段" 这类没有问号的题也能识别）
 //   4. 选择优先级：
 //      ① 选项含「以上都是/以上都对」家族 → 必选
@@ -12,6 +14,7 @@
 //      ④ 单选 → 选文字最长项（排除肯定句陷阱）
 //   5. 选项点完自动点确认按钮；若提示「火爆/繁忙/失败」循环重提直至成功
 //   6. 全程随机延迟模拟真人，降低风控特征
+//   7. 诊断日志极详细：发现新题记快照；找不到选项时 dump 区域内所有可点项
 //
 // 注入：Theos + ellekit 编译 dylib → TrollFools 注入淘宝 → TrollStore 安装
 
@@ -25,14 +28,14 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 // ---------------- 配置：模拟手速（防风控） ----------------
-static const double kReadingMin   = 0.10; // 看题最短（秒）——抢红包要快
-static const double kReadingMax   = 0.20; // 看题最长
+static const double kReadingMin   = 0.10; // 看题最短（秒）
+static const double kReadingMax   = 0.20;
 static const double kOptionGapMin = 0.20; // 多选两次点击最小间隔
 static const double kOptionGapMax = 0.30;
 static const double kConfirmMin   = 0.20; // 选完到点确认按钮
 static const double kConfirmMax   = 0.30;
 
-// 「以上都是 / 以上都对 / 以上都选 / 以上全选」家族——选项里出现则默认必选
+// 「以上都是 / 以上都对 / 以上都选 / 以上全选」家族
 static NSArray<NSString *> *allAboveMarkers(void) {
     static NSArray *m;
     static dispatch_once_t once;
@@ -44,23 +47,22 @@ static NSArray<NSString *> *allAboveMarkers(void) {
 
 // ---------------- 状态 ----------------
 static NSArray *gBank = nil;
-static BOOL gEnabled = NO;            // 悬浮球手动开关，默认关
-static BOOL gWorking = NO;            // 一道题处理中
-static NSMutableSet *gDoneQ = nil;    // 已处理过的题（按题干去重，防重复提交）
-static NSString *gLastKey = nil;      // 当前题标识
+static BOOL gEnabled = NO;
+static BOOL gWorking = NO;
+static NSMutableSet *gDoneQ = nil;
+static NSString *gLastKey = nil;
 static UIWindow *gOverlay = nil;
 static UIButton *gToggleBtn = nil;
 
-// 可编辑题库（运行时热更新，无需重装 dylib；现在仅作备份，启发式优先）
-static NSString *gExternalPath = nil;   // app 沙盒 Documents/AutoAnswer_questions.json
-static NSString *gBundledPath = nil;    // 内置 questions.json（随 dylib 编译进 App）
-static NSDate   *gExternalMtime = nil;  // 外部题库最后加载时间
+static NSString *gExternalPath = nil;
+static NSString *gBundledPath = nil;
+static NSDate   *gExternalMtime = nil;
 
 static double rnd(double a, double b) {
     return a + ((double)arc4random_uniform(10000) / 10000.0) * (b - a);
 }
 
-// ---------------- 文件日志（方便用 Filza 查看，无需 Mac/syslog） ----------------
+// ---------------- 文件日志 ----------------
 static NSString *aaLogPath(void) {
     NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     return [docs.firstObject stringByAppendingPathComponent:@"AutoAnswer_log.txt"];
@@ -151,7 +153,6 @@ static void loadBank(void) {
     gExternalPath = [dir stringByAppendingPathComponent:@"AutoAnswer_questions.json"];
 }
 
-// 把一条题规范化成可比对的签名（用于去重，避免内置/外部重复）
 static NSString *entrySignature(id entry) {
     if (![entry isKindOfClass:[NSDictionary class]]) return [entry description];
     NSDictionary *e = (NSDictionary *)entry;
@@ -166,7 +167,6 @@ static NSString *entrySignature(id entry) {
     return [NSString stringWithFormat:@"%@|%@|%@", e[@"q"] ?: @"", aStr, kwStr];
 }
 
-// 【自动导入】把内置 questions.json 的新题自动合并进外部可编辑文件
 static void mergeBundledIntoExternal(void) {
     if (!gBundledPath || !gExternalPath) return;
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -192,7 +192,6 @@ static void mergeBundledIntoExternal(void) {
     }
 }
 
-// 题库热更新：外部文件优先于内置；改了文件下一次轮询（0.2s）自动生效
 static void reloadBankIfNeeded(void) {
     if (!gExternalPath) return;
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -222,27 +221,9 @@ static void reloadBankIfNeeded(void) {
     }
 }
 
-// ---------------- 找可点击目标（选项/按钮） ----------------
-// 只把「真正可点」的视图当作点击目标（UIControl 或带点按手势），
-// 题干 Label 不可点，天然不会被误当成选项点下去。
-static UIView *findTapTarget(UIView *view) {
-    UIView *v = view;
-    int depth = 0;
-    while (v && depth < 6) {
-        if ([v isKindOfClass:[UIControl class]]) return v;
-        for (UIGestureRecognizer *g in v.gestureRecognizers)
-            if ([g isKindOfClass:[UITapGestureRecognizer class]]) return v;
-        v = v.superview;
-        depth++;
-    }
-    return nil;
-}
-
-// ---------------- 收集：全部文字（带窗口坐标）+ 可点目标 ----------------
-// tappables  元素：@[文字, 可点视图, 目标在窗口坐标的frame]
-// textFrames 元素：@[文字, 文字在窗口坐标的frame, 所在window（可能为 NSNull）]
-static void collectViews(UIView *view, NSMutableString *allTexts,
-                         NSMutableArray *tappables, NSMutableArray *textFrames) {
+// ---------------- 收集①：全部文字（带窗口坐标） ----------------
+// textFrames 元素：@[文字, 窗口坐标frame, 所在window（可能为 NSNull）]
+static void collectViews(UIView *view, NSMutableString *allTexts, NSMutableArray *textFrames) {
     if (!view || view.hidden || view.alpha < 0.01) return;
     NSString *t = nil;
     if ([view isKindOfClass:[UILabel class]])         t = [(UILabel *)view text];
@@ -251,20 +232,83 @@ static void collectViews(UIView *view, NSMutableString *allTexts,
         id x = [view performSelector:@selector(text)];
         if ([x isKindOfClass:[NSString class]]) t = x;
     }
-    if (t.length) {
+    if (t.length && textFrames) {
         [allTexts appendFormat:@"%@\n", t];
-        if (textFrames) {
-            CGRect wf = [view convertRect:view.bounds toView:nil];
-            id wnd = view.window ?: (id)[NSNull null];
-            [textFrames addObject:@[t, [NSValue valueWithCGRect:wf], wnd]];
-        }
-        UIView *target = findTapTarget(view);
-        if (target) {
-            CGRect tf = [target convertRect:target.bounds toView:nil];
-            [tappables addObject:@[t, target, [NSValue valueWithCGRect:tf]]];
-        }
+        CGRect wf = [view convertRect:view.bounds toView:nil];
+        id wnd = view.window ?: (id)[NSNull null];
+        [textFrames addObject:@[t, [NSValue valueWithCGRect:wf], wnd]];
     }
-    for (UIView *c in view.subviews) collectViews(c, allTexts, tappables, textFrames);
+    for (UIView *c in view.subviews) collectViews(c, allTexts, textFrames);
+}
+
+// ---------------- 收集②：可点载体（UIControl 或带点按手势，不限深度） ----------------
+// targets 元素：@[载体view, 窗口坐标frame, 所在window（可能为 NSNull）]
+static void collectTapTargets(UIView *view, NSMutableArray *targets) {
+    if (!view || view.hidden || view.alpha < 0.01) return;
+    BOOL isCtrl = NO;
+    if ([view isKindOfClass:[UIControl class]]) {
+        UIControl *c = (UIControl *)view;
+        isCtrl = c.enabled && c.userInteractionEnabled;
+    }
+    BOOL hasTap = NO;
+    if (!isCtrl && view.userInteractionEnabled) {
+        for (UIGestureRecognizer *g in view.gestureRecognizers)
+            if ([g isKindOfClass:[UITapGestureRecognizer class]]) { hasTap = YES; break; }
+    }
+    if (isCtrl || hasTap) {
+        CGRect f = [view convertRect:view.bounds toView:nil];
+        id wnd = view.window ?: (id)[NSNull null];
+        [targets addObject:@[view, [NSValue valueWithCGRect:f], wnd]];
+    }
+    for (UIView *c in view.subviews) collectTapTargets(c, targets);
+}
+
+// ---------------- 整屏扫描：文字归属到最小的可点载体 ----------------
+// 产出 tappables 元素：@[文字, 载体view, 载体窗口坐标frame]（同名去重，保留最小=最内层真实按钮）
+static void scanScreen(NSMutableString *all, NSMutableArray *tappables, NSMutableArray *textFrames) {
+    NSMutableArray *targets = [NSMutableArray array];
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]] &&
+                ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
+                for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                    if (w.isHidden || w.alpha < 0.01) continue;
+                    collectViews(w, all, textFrames);
+                    collectTapTargets(w, targets);
+                }
+            }
+        }
+    } else {
+        UIWindow *kw = UIApplication.sharedApplication.keyWindow;
+        collectViews(kw, all, textFrames);
+        collectTapTargets(kw, targets);
+    }
+
+    NSMutableDictionary *best = [NSMutableDictionary dictionary];
+    for (NSArray *tp in targets) {
+        if (tp.count < 3) continue;
+        id tw = tp[2];
+        if (![tw isKindOfClass:[UIView class]]) continue;
+        UIView *tv = tp[0];
+        CGRect tf = [(NSValue *)tp[1] CGRectValue];
+        NSMutableString *txt = [NSMutableString string];
+        for (NSArray *p in textFrames) {
+            if (p.count < 3) continue;
+            if (p[2] != tw) continue;                     // 必须同窗口
+            CGRect lf = [(NSValue *)p[1] CGRectValue];
+            if (CGRectContainsRect(tf, lf)) {
+                if (txt.length) [txt appendString:@" "];
+                [txt appendString:p[0]];
+            }
+        }
+        if (!txt.length) continue;
+        NSArray *entry = @[[NSString stringWithString:txt], tv, tp[1]];
+        NSArray *cur = best[txt];
+        if (!cur) { best[txt] = entry; continue; }
+        CGRect cf = [(NSValue *)cur[2] CGRectValue];
+        if (tf.size.width * tf.size.height < cf.size.width * cf.size.height) best[txt] = entry;
+    }
+    [tappables addObjectsFromArray:best.allValues];
 }
 
 // ---------------- 网页视图检测（诊断用） ----------------
@@ -276,11 +320,8 @@ static void scanWebViews(UIView *v) {
     if ((wk  && [v isKindOfClass:wk])  || (uiw && [v isKindOfClass:uiw])) gWebViewCount++;
     for (UIView *c in v.subviews) scanWebViews(c);
 }
-// 注意：早期版本曾在此对屏上每个 WKWebView 自动跑 evaluateJavaScript 读 DOM，
-// 会在淘宝主页大量 WebView 未就绪时导致 App 闪退，已移除。
 
 // ---------------- 找确认按钮（提交/确认/我知道了/确定…） ----------------
-// 确认按钮是定位答题弹窗的锚点：选项都在它上方、同一窗口内。
 static UIView *findConfirmBtn(NSArray *tappables, CGRect *outFrame) {
     static NSArray *markers = nil;
     static dispatch_once_t once;
@@ -302,7 +343,6 @@ static UIView *findConfirmBtn(NSArray *tappables, CGRect *outFrame) {
 }
 
 // ---------------- 题干里的数字（阿拉伯/中文都认） ----------------
-// "圣歌兰臻研三段分域面颈膜，分为几段" → 三 → 3 → 匹配纯数字选项 "3"
 static NSInteger firstNumeralIn(NSString *s) {
     if (s.length == 0) return 0;
     NSDictionary *cn = @{@"一":@1, @"二":@2, @"两":@2, @"三":@3, @"四":@4,
@@ -317,7 +357,7 @@ static NSInteger firstNumeralIn(NSString *s) {
     return 0;
 }
 
-// ---------------- 肯定句判定（单选题里这类多为陷阱，不选） ----------------
+// ---------------- 肯定句判定 ----------------
 static BOOL isAffirmativeSentence(NSString *t) {
     if (![t isKindOfClass:[NSString class]] || t.length == 0) return NO;
     NSArray *markers = @[@"确实",@"当然",@"肯定",@"毫无疑问",@"没错",@"是的",
@@ -331,12 +371,10 @@ static BOOL isAffirmativeSentence(NSString *t) {
 static void tapView(UIView *view) {
     if (!view) return;
     @try {
-        // 1) 本身是 UIControl（按钮等）→ 直接触发，最安全
         if ([view isKindOfClass:[UIControl class]]) {
             [(UIControl *)view sendActionsForControlEvents:UIControlEventTouchUpInside];
             return;
         }
-        // 2) 中心命中测试找子 UIControl（很多选项是按钮包在容器里）
         CGRect r = view.bounds;
         if (r.size.width > 0 && r.size.height > 0) {
             UIView *hit = [view hitTest:CGPointMake(r.size.width/2, r.size.height/2) withEvent:nil];
@@ -345,7 +383,6 @@ static void tapView(UIView *view) {
                 return;
             }
         }
-        // 3) 兜底：手势 target/action（最不安全，做足防护再调用）
         for (UIGestureRecognizer *g in view.gestureRecognizers) {
             if (![g isKindOfClass:[UITapGestureRecognizer class]]) continue;
             id target = nil;
@@ -370,17 +407,10 @@ static void retrySubmitIfBusy(UIView *confirm, NSInteger left) {
     @try {
         NSMutableString *all2 = [NSMutableString string];
         NSMutableArray *tap2 = [NSMutableArray array];
-        if (@available(iOS 13.0, *)) {
-            for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-                if ([s isKindOfClass:[UIWindowScene class]] &&
-                    ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
-                    for (UIWindow *w in ((UIWindowScene *)s).windows)
-                        if (!w.isHidden && w.alpha > 0.01) collectViews(w, all2, tap2, nil);
-                }
-            }
-        }
+        NSMutableArray *tf2 = [NSMutableArray array];
+        scanScreen(all2, tap2, tf2);
         BOOL busy = NO;
-        for (NSString *k in @[@"火爆",@"繁忙",@"失败",@"稍后",@"重试",@"超时",@"抢不到",@"人太多",@"网络"]) {
+        for (NSString *k in @[@"火爆",@"繁忙",@"失败",@"稍后",@"重试",@"超时",@"抢不到",@"人太多"]) {
             if ([all2 containsString:k]) { busy = YES; break; }
         }
         UIView *confirm2 = findConfirmBtn(tap2, NULL);
@@ -401,7 +431,6 @@ static void retrySubmitIfBusy(UIView *confirm, NSInteger left) {
 
 // ---------------- 主循环 ----------------
 static void tick(void) {
-    // 悬浮球懒创建：必须放在所有提前 return 之前（无条件创建）
     if (!gOverlay) {
         UIWindowScene *sc = nil;
         for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
@@ -414,23 +443,11 @@ static void tick(void) {
 
     reloadBankIfNeeded();
 
-    // 收集前台场景里【所有 window】的文字（带坐标）与可点目标
     NSMutableString *all = [NSMutableString string];
     NSMutableArray *tappables = [NSMutableArray array];
     NSMutableArray *textFrames = [NSMutableArray array];
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-            if ([s isKindOfClass:[UIWindowScene class]] &&
-                ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *w in ((UIWindowScene *)s).windows)
-                    if (!w.isHidden && w.alpha > 0.01) collectViews(w, all, tappables, textFrames);
-            }
-        }
-    } else {
-        collectViews(UIApplication.sharedApplication.keyWindow, all, tappables, textFrames);
-    }
+    scanScreen(all, tappables, textFrames);
 
-    // 统计屏上网页视图数量（诊断用）
     gWebViewCount = 0;
     if (@available(iOS 13.0, *)) {
         for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
@@ -444,7 +461,7 @@ static void tick(void) {
         scanWebViews(UIApplication.sharedApplication.keyWindow);
     }
 
-    // ===== 定位答题弹窗：以确认按钮（提交/我知道了/确定）为锚点 =====
+    // ===== 定位答题弹窗：以确认按钮为锚点 =====
     static NSArray *nonOptionWords = nil;
     static dispatch_once_t onceNon;
     dispatch_once(&onceNon, ^{
@@ -460,7 +477,7 @@ static void tick(void) {
             if (p.count >= 3 && p[1] == confirm) { confirmText = p[0]; break; }
     }
 
-    // 选项候选：确认按钮上方 520pt 内、与确认按钮同窗口、文字 <= 40 字
+    // 选项候选：确认按钮上方 520pt 内、同窗口、文字 ≤ 40 字
     NSMutableArray *options = [NSMutableArray array];
     if (confirm) {
         UIWindow *cw = confirm.window;
@@ -469,12 +486,12 @@ static void tick(void) {
             UIView *v = p[1];
             if (v == confirm) continue;
             if (gToggleBtn && v == gToggleBtn) continue;
-            if (cw && v.window != cw) continue;                 // 必须与确认按钮同窗口
+            if (cw && v.window != cw) continue;
             CGRect f = [(NSValue *)p[2] CGRectValue];
-            if (CGRectGetMaxY(f) > CGRectGetMinY(confirmFrame) + 4) continue;       // 必须在确认按钮上方
-            if (CGRectGetMinY(f) < CGRectGetMinY(confirmFrame) - 520) continue;     // 必须在弹窗区域内
+            if (CGRectGetMaxY(f) > CGRectGetMinY(confirmFrame) + 4) continue;
+            if (CGRectGetMinY(f) < CGRectGetMinY(confirmFrame) - 520) continue;
             NSString *t = p[0];
-            if (t.length == 0 || t.length > 40) continue;       // 排除商品卡等超长文本
+            if (t.length == 0 || t.length > 40) continue;
             BOOL skip = NO;
             for (NSString *w in nonOptionWords) if ([t containsString:w]) { skip = YES; break; }
             if (skip) continue;
@@ -482,7 +499,7 @@ static void tick(void) {
         }
     }
 
-    // 题干：所有选项上方 260pt 内、同窗口的最长文字（不要求带问号）
+    // 题干：所有选项上方 260pt 内、同窗口的最长文字（不要求问号）
     NSString *qText = @"";
     if (options.count >= 2) {
         CGFloat optionsMinY = CGFLOAT_MAX;
@@ -499,24 +516,41 @@ static void tick(void) {
             NSString *t = p[0];
             if (t.length < 2) continue;
             if ([t containsString:@"答题抢红包"] || [t containsString:@"已结束"] ||
-                [t containsString:@"超时"]   || [t containsString:@"红包"]) continue;
+                [t containsString:@"超时"]   || [t containsString:@"红包"] ||
+                [t containsString:@"剩余"]   || [t containsString:@"答题时间"]) continue;
             CGRect f = [(NSValue *)p[1] CGRectValue];
-            if (CGRectGetMaxY(f) > optionsMinY + 4) continue;             // 必须在所有选项上方
-            if (CGRectGetMaxY(f) < optionsMinY - 260) continue;           // 且不能太远（排除屏顶横幅）
+            if (CGRectGetMaxY(f) > optionsMinY + 4) continue;
+            if (CGRectGetMaxY(f) < optionsMinY - 260) continue;
             if (t.length > qText.length) qText = t;
         }
     }
 
-    // 诊断日志（每 2 秒）：把识别结果也打出来，便于远程调试
+    // 诊断日志（每 2 秒）
     {
         static NSDate *gLastDiag2 = nil;
         NSDate *now = [NSDate date];
         if (!gLastDiag2 || [now timeIntervalSinceDate:gLastDiag2] > 2.0) {
             gLastDiag2 = now;
-            aaLog(@"[诊断] 文字%lu 可点%lu 网页%ld | 确认=%@ 选项%lu 题干=%@",
-                  (unsigned long)all.length, (unsigned long)tappables.count, (long)gWebViewCount,
+            aaLog(@"[诊断] 文字%lu 载体%lu 可点%lu 网页%ld | 确认=%@ 选项%lu 题干=%@",
+                  (unsigned long)all.length, (unsigned long)tappables.count, (unsigned long)options.count,
+                  (long)gWebViewCount,
                   confirmText.length ? confirmText : (confirm ? @"有" : @"无"),
                   (unsigned long)options.count, qText.length ? qText : @"-");
+            if (confirm && options.count < 2) {
+                // 找到了确认钮但选项不够 → dump 确认钮上方的所有可点项，便于定位区域问题
+                NSMutableArray *dbg = [NSMutableArray array];
+                for (NSArray *p in tappables) {
+                    if (p.count < 3) continue;
+                    if (p[1] == confirm) continue;
+                    CGRect f = [(NSValue *)p[2] CGRectValue];
+                    if (CGRectGetMaxY(f) > CGRectGetMinY(confirmFrame) + 4) continue;
+                    if (CGRectGetMinY(f) < CGRectGetMinY(confirmFrame) - 520) continue;
+                    if (dbg.count >= 8) break;
+                    [dbg addObject:[NSString stringWithFormat:@"「%@」@(%.0f,%.0f)", p[0],
+                                    CGRectGetMinX(f), CGRectGetMinY(f)]];
+                }
+                aaLog(@"[诊断] 确认钮上方可点项dump：%@", dbg);
+            }
             if (all.length < 2) {
                 if (gWebViewCount > 0) {
                     aaLog(@"[诊断] 原生读不到文字但屏上有 %ld 个网页视图 → 可能答题界面是网页(WebView)渲染",
@@ -528,20 +562,23 @@ static void tick(void) {
         }
     }
 
-    if (!confirm || options.count < 2) return;   // 屏上没有答题弹窗
+    if (!confirm || options.count < 2) return;
     if (all.length < 2) return;
 
-    NSString *qkey = qText.length ? qText : @"选项串";
+    NSString *qkey = qText;
     if (qText.length == 0) {
         NSMutableArray *ts = [NSMutableArray array];
         for (NSArray *p in options) [ts addObject:p[0]];
         qkey = [ts componentsJoinedByString:@"|"];
     }
-    if (![qkey isEqualToString:gLastKey]) {  // 换题了，重置已点记录
+    if (![qkey isEqualToString:gLastKey]) {  // 换题了：记快照 + 重置已点记录
         gLastKey = qkey;
         [gDoneQ removeAllObjects];
+        NSMutableArray *ots = [NSMutableArray array];
+        for (NSArray *p in options) [ots addObject:p[0]];
+        aaLog(@"发现新题：「%@」 选项：%@", qText.length ? qText : @"-", ots);
     }
-    if ([gDoneQ containsObject:qkey]) return; // 这道题已经处理过（防重复提交）
+    if ([gDoneQ containsObject:qkey]) return;
 
     // ===== 启发式自动作答 =====
     NSMutableArray *optViews = [NSMutableArray array];
@@ -559,7 +596,7 @@ static void tick(void) {
             if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
         aaLog(@"命中「以上都是」必选，共 %lu 项", (unsigned long)optViews.count);
     } else {
-        // ② 多选：题干含「数字+个/种/项」→ 4全选 / 3随机3 / 2随机2
+        // ② 多选：题干含「数字+个/种/项」
         BOOL isMulti = NO; NSInteger needN = 0;
         NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(\\d)\\s*[个种项]"
                                                                               options:0 error:nil];
@@ -606,7 +643,7 @@ static void tick(void) {
                     }
                 }
             }
-            // ④ 单选最长（排除肯定句；全被排除则退化选最长）
+            // ④ 单选最长（排除肯定句）
             if (!optViews.count) {
                 NSString *bestText = nil; UIView *bestView = nil; NSUInteger bestLen = 0;
                 for (NSArray *p in options) {
@@ -628,7 +665,7 @@ static void tick(void) {
 
     if (!optViews.count) return;
 
-    // ===== 模拟手速：看题 → 逐个点选项（随机间隔）→ 点确认 → 火爆则循环重提 =====
+    // ===== 模拟手速：看题 → 逐个点选项 → 点确认 → 火爆则循环重提 =====
     gWorking = YES;
     [gDoneQ addObject:qkey];
     double reading = rnd(kReadingMin, kReadingMax);
@@ -671,11 +708,11 @@ static void tick(void) {
 %ctor {
     @try { [[NSFileManager defaultManager] removeItemAtPath:aaLogPath() error:nil]; } @catch (...) {}
     loadBank();
-    reloadBankIfNeeded();   // 首次启动把内置题库复制成可编辑文件
+    reloadBankIfNeeded();
     gDoneQ = [NSMutableSet set];
     [NSTimer scheduledTimerWithTimeInterval:0.2
                                     repeats:YES
                                       block:^(NSTimer *t){ tick(); }];
-    aaLog(@"插件已加载（区域化识别版），内置题库 %lu 条\n默认关闭（点悬浮球开启）",
+    aaLog(@"插件已加载（反向识别版），内置题库 %lu 条\n默认关闭（点悬浮球开启）",
           (unsigned long)(gBank ? gBank.count : 0));
 }
