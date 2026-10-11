@@ -41,7 +41,8 @@ static NSArray<NSString *> *allAboveMarkers(void) {
     static NSArray *m;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        m = @[@"以上都是", @"以上都对", @"以上都选", @"以上全选"];
+        m = @[@"以上都是", @"以上都对", @"以上都选", @"以上全选",
+              @"以上全对", @"以上全部", @"全部都对", @"全部都是", @"全部都选"];
     });
     return m;
 }
@@ -350,6 +351,34 @@ static NSInteger firstNumeralIn(NSString *s) {
     return 0;
 }
 
+// ---------------- 题干「哪2 / 哪3 / 哪4 / 哪两 / 哪三 / 哪四」→ 多选 N ----------------
+static NSInteger detectWhichN(NSString *q) {
+    if (![q isKindOfClass:[NSString class]] || q.length == 0) return 0;
+    NSDictionary *cn = @{@"一":@1, @"二":@2, @"两":@2, @"三":@3, @"四":@4,
+                         @"五":@5, @"六":@6, @"七":@7, @"八":@8, @"九":@9, @"十":@10};
+    NSRange r = [q rangeOfString:@"哪"];
+    if (r.location == NSNotFound) return 0;
+    NSUInteger start = r.location + 1;
+    NSUInteger end = MIN(start + 3, q.length);      // 只看「哪」后面 3 个字符
+    for (NSUInteger i = start; i < end; i++) {
+        unichar ch = [q characterAtIndex:i];
+        if (ch >= '1' && ch <= '9') return ch - '0';
+        NSNumber *v = cn[[q substringWithRange:NSMakeRange(i, 1)]];
+        if (v) return v.intValue;
+    }
+    return 0;
+}
+
+// ---------------- 纯数字选项判定（如选项就是 "3" / "4"） ----------------
+static BOOL isPureNumber(NSString *t) {
+    if (![t isKindOfClass:[NSString class]] || t.length == 0 || t.length > 3) return NO;
+    for (NSUInteger i = 0; i < t.length; i++) {
+        unichar ch = [t characterAtIndex:i];
+        if (ch < '0' || ch > '9') return NO;
+    }
+    return YES;
+}
+
 // ---------------- 肯定句判定 ----------------
 static BOOL isAffirmativeSentence(NSString *t) {
     if (![t isKindOfClass:[NSString class]] || t.length == 0) return NO;
@@ -594,168 +623,133 @@ static void tick(void) {
     }
     if ([gDoneQ containsObject:qkey]) return;
 
-    // ===== 题库比对作答（优先） =====
-    // 选项为原生 UITextView，控件树直接读字，无需 OCR / WebView。
-    // 流程：题干 + 选项 → 逐条用 kw 匹配 → 命中取 a（答案文本/数组）→ 在选项候选里找文字匹配的载体点击。
+    // ===== 启发式自动作答（不依赖题库，纯按题面规律判断 单选/多选） =====
+    // 规则优先级：
+    //   ① 选项含「以上/全部 都对 / 都是 / 都选」→ 直接选它
+    //   ② 题干「哪2 / 哪3 / 哪4 / 哪两 / 哪三 / 哪四」→ 多选 N（N ≥ 选项数则全选）
+    //   ③ 题干「阿拉伯数字 + 个/种/项」→ 多选 N
+    //   ④ 题干有数字（如「三」）但不是「哪N」→ 选项里若有数字 N 与 N+1，两个都选；只有 N 就只选 N
+    //   ⑤ 其余（题干无数字）→ 单选：「一长三短」选最长，否则随机选一个
+    //   ⑥ 选完统一点下方「确认提交」
     NSMutableArray *optViews = [NSMutableArray array];
     NSMutableArray *optTexts = [NSMutableArray array];
 
-    NSMutableString *searchText = [NSMutableString string];   // 题干 + 选项（精准匹配域）
-    if (qText.length) [searchText appendFormat:@"%@\n", qText];
-    {
-        NSMutableArray *ot = [NSMutableArray array];
-        for (NSArray *p in options) [ot addObject:p[0]];
-        [searchText appendFormat:@"%@\n", [ot componentsJoinedByString:@"\n"]];
+    // ① 「以上/全部都对」家族 → 直接选
+    NSMutableArray *allAbove = [NSMutableArray array];
+    for (NSArray *p in options) {
+        for (NSString *m in allAboveMarkers())
+            if ([p[0] containsString:m]) { [allAbove addObject:p]; break; }
+    }
+    if (allAbove.count > 0) {
+        for (NSArray *p in allAbove)
+            if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
+        aaLog(@"① 命中「以上/全部都对」→ 直接选：%@", optTexts);
     }
 
-    // 归一：去空格/制表，便于「7 节」vs「7节」之类匹配
-    NSString *(^norm)(NSString *) = ^(NSString *s){
-        NSMutableString *m = [NSMutableString stringWithString:s ?: @""];
-        [m replaceOccurrencesOfString:@" "  withString:@"" options:0 range:NSMakeRange(0, m.length)];
-        [m replaceOccurrencesOfString:@"\t" withString:@"" options:0 range:NSMakeRange(0, m.length)];
-        return [NSString stringWithString:m];
-    };
-
-    // 按答案文字找可点载体：先精确匹配，再子串匹配；先在 options 里找，再在原始 TextView/UILabel 里找
-    UIView *(^viewForAnswer)(NSString *) = ^UIView *(NSString *ans){
-        NSString *an = norm(ans);
-        // 第一遍：精确相等（最可靠）
-        for (NSArray *p in options) {
-            if (p.count < 3) continue;
-            if ([norm(p[0]) isEqualToString:an]) return p[1];
-        }
-        for (NSArray *p in textFrames) {
-            if (p.count < 4) continue;
-            if ([norm(p[0]) isEqualToString:an]) return p[3];
-        }
-        // 第二遍：子串包含（任一方向）
-        for (NSArray *p in options) {
-            if (p.count < 3) continue;
-            NSString *ot = norm(p[0]);
-            if ([ot containsString:an] || [an containsString:ot]) return p[1];
-        }
-        for (NSArray *p in textFrames) {
-            if (p.count < 4) continue;
-            NSString *ot = norm(p[0]);
-            if ([ot containsString:an] || [an containsString:ot]) return p[3];
-        }
-        return nil;
-    };
-
-    NSDictionary *hit = nil;
-    NSString *hitKw = nil;
-    if (gBank) {
-        for (NSDictionary *e in gBank) {
-            if (![e isKindOfClass:[NSDictionary class]]) continue;
-            id kws = e[@"kw"] ?: @[];
-            if (![kws isKindOfClass:[NSArray class]]) kws = @[kws];
-            for (NSString *k in kws) {
-                if ([k isKindOfClass:[NSString class]] && k.length && [searchText containsString:k]) {
-                    hit = e; hitKw = k; break;
-                }
-            }
-            if (hit) break;
-        }
-    }
-
-    if (hit) {
-        id ans = hit[@"a"];
-        NSArray *ansList = [ans isKindOfClass:[NSArray class]] ? ans : @[ans];
-        aaLog(@"题库命中：kw=%@ → 答案=%@（题面：%@）", hitKw, ansList, qText.length ? qText : @"-");
-        for (id a in ansList) {
-            if (![a isKindOfClass:[NSString class]] || ![a length]) continue;
-            UIView *v = viewForAnswer(a);
-            if (v && ![optTexts containsObject:a]) {
-                [optViews addObject:v];
-                [optTexts addObject:(NSString *)a];
-            } else if (!v) {
-                aaLog(@"⚠️ 答案「%@」在选项候选里找不到对应 TextView", a);
-            }
-        }
-        if (optViews.count == 0)
-            aaLog(@"⚠️ 题库命中但选项里无对应文字（答案=%@）→ 回退启发式", ansList);
-    } else {
-        aaLog(@"题库未命中（题面：%@）→ 回退启发式猜答", qText.length ? qText : @"-");
-    }
-
-    // ===== 启发式回退（题库未命中，或命中但找不到对应选项文字） =====
-    if (optViews.count == 0) {
-        // ① 「以上都是」家族必选
-        NSMutableArray *allAbove = [NSMutableArray array];
-        for (NSArray *p in options) {
-            for (NSString *m in allAboveMarkers())
-                if ([p[0] containsString:m]) { [allAbove addObject:p]; break; }
-        }
-        if (allAbove.count > 0) {
-            for (NSArray *p in allAbove)
-                if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
-            aaLog(@"命中「以上都是」必选，共 %lu 项", (unsigned long)optViews.count);
-        } else {
-            // ② 多选：题干含「数字+个/种/项」
-            BOOL isMulti = NO; NSInteger needN = 0;
-            NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(\\d)\\s*[个种项]"
-                                                                                  options:0 error:nil];
-            NSArray *ms = [re matchesInString:qText options:0 range:NSMakeRange(0, qText.length)];
-            NSInteger best = 0;
-            for (NSTextCheckingResult *m in ms) {
-                NSInteger d = [[qText substringWithRange:[m rangeAtIndex:1]] integerValue];
-                if (d == 4) { best = 4; break; }
-                if (d == 3 && best < 3) best = 3;
-                if (d == 2 && best < 2) best = 2;
-            }
-            if (best > 0) { isMulti = YES; needN = best; }
-
-            if (isMulti) {
-                NSMutableArray *pool = [NSMutableArray arrayWithArray:options];
-                if (needN >= (NSInteger)pool.count) {
-                    for (NSArray *p in pool)
-                        if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
-                    aaLog(@"多选：全选 %lu 项（needN=%ld）", (unsigned long)optViews.count, (long)needN);
-                } else {
-                    while (optViews.count < needN && pool.count) {
-                        NSUInteger idx = arc4random_uniform((uint32_t)pool.count);
-                        NSArray *p = pool[idx];
-                        [pool removeObjectAtIndex:idx];
-                        if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
-                    }
-                    aaLog(@"多选：随机选 %lu 项（needN=%ld）", (unsigned long)optViews.count, (long)needN);
-                }
+    // ② 题干「哪N」→ 多选 N
+    if (!optViews.count) {
+        NSInteger needN = detectWhichN(qText);
+        if (needN > 0) {
+            aaLog(@"② 题干含「哪%ld」→ 多选 %ld 个（共 %lu 个选项）",
+                  (long)needN, (long)needN, (unsigned long)options.count);
+            if (needN >= (NSInteger)options.count) {
+                for (NSArray *p in options)
+                    if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
             } else {
-                // ③ 纯数字选项 + 题干数字匹配（含中文数字：三→3）
-                NSInteger n = firstNumeralIn(qText);
-                if (n > 0) {
-                    for (NSArray *p in options) {
-                        NSString *t = p[0];
-                        BOOL pureNum = (t.length >= 1 && t.length <= 3);
-                        for (NSUInteger i = 0; pureNum && i < t.length; i++) {
-                            unichar ch = [t characterAtIndex:i];
-                            if (ch < '0' || ch > '9') pureNum = NO;
-                        }
-                        if (pureNum && t.intValue == n) {
-                            [optViews addObject:p[1]]; [optTexts addObject:t];
-                            aaLog(@"数字匹配：题干含数字 %ld → 选「%@」", (long)n, t);
-                            break;
-                        }
-                    }
-                }
-                // ④ 单选最长（排除肯定句）
-                if (!optViews.count) {
-                    NSString *bestText = nil; UIView *bestView = nil; NSUInteger bestLen = 0;
-                    for (NSArray *p in options) {
-                        NSString *t = p[0];
-                        if (isAffirmativeSentence(t)) continue;
-                        if (t.length > bestLen) { bestLen = t.length; bestText = t; bestView = p[1]; }
-                    }
-                    if (!bestView) {
-                        for (NSArray *p in options) {
-                            NSString *t = p[0];
-                            if (t.length > bestLen) { bestLen = t.length; bestText = t; bestView = p[1]; }
-                        }
-                    }
-                    if (bestView) { [optViews addObject:bestView]; [optTexts addObject:bestText]; }
-                    aaLog(@"单选：选最长项（%lu 字符）%@", (unsigned long)bestLen, bestText ?: @"");
+                NSMutableArray *pool = [NSMutableArray arrayWithArray:options];
+                while (optViews.count < needN && pool.count) {
+                    NSUInteger idx = arc4random_uniform((uint32_t)pool.count);
+                    NSArray *p = pool[idx];
+                    [pool removeObjectAtIndex:idx];
+                    if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
                 }
             }
+        }
+    }
+
+    // ③ 题干「阿拉伯数字 + 个/种/项」→ 多选 N
+    if (!optViews.count) {
+        NSInteger best = 0;
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(\\d)\\s*[个种项]"
+                                                                              options:0 error:nil];
+        NSArray *ms = [re matchesInString:qText options:0 range:NSMakeRange(0, qText.length)];
+        for (NSTextCheckingResult *m in ms) {
+            NSInteger d = [[qText substringWithRange:[m rangeAtIndex:1]] integerValue];
+            if (d == 4) { best = 4; break; }
+            if (d == 3 && best < 3) best = 3;
+            if (d == 2 && best < 2) best = 2;
+        }
+        if (best > 0) {
+            aaLog(@"③ 题干含「%ld + 个/种/项」→ 多选 %ld 个", (long)best, (long)best);
+            if (best >= (NSInteger)options.count) {
+                for (NSArray *p in options)
+                    if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
+            } else {
+                NSMutableArray *pool = [NSMutableArray arrayWithArray:options];
+                while (optViews.count < best && pool.count) {
+                    NSUInteger idx = arc4random_uniform((uint32_t)pool.count);
+                    NSArray *p = pool[idx];
+                    [pool removeObjectAtIndex:idx];
+                    if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
+                }
+            }
+        }
+    }
+
+    // ④ 题干有数字但不是「哪N」→ 选项里有数字 N 与 N+1 就两个都选；只有 N 就只选 N
+    if (!optViews.count) {
+        NSInteger n = firstNumeralIn(qText);
+        if (n > 0) {
+            NSMutableArray *numOpt = [NSMutableArray array];
+            for (NSArray *p in options) if (isPureNumber(p[0])) [numOpt addObject:p];
+            NSArray *hitN = nil, *hitN1 = nil;
+            for (NSArray *p in numOpt) {
+                if (!hitN  && [p[0] intValue] == n)     hitN  = p;
+                if (!hitN1 && [p[0] intValue] == n + 1) hitN1 = p;
+            }
+            if (hitN && hitN1) {
+                [optViews addObject:hitN[1]];  [optTexts addObject:hitN[0]];
+                [optViews addObject:hitN1[1]]; [optTexts addObject:hitN1[0]];
+                aaLog(@"④ 题干含数字 %ld（非「哪N」）→ 选项里有 %ld 和 %ld → 两个都选",
+                      (long)n, (long)n, (long)(n + 1));
+            } else if (hitN) {
+                [optViews addObject:hitN[1]]; [optTexts addObject:hitN[0]];
+                aaLog(@"④ 题干含数字 %ld → 选对应数字项：%@", (long)n, hitN[0]);
+            }
+        }
+    }
+
+    // ⑤ 其余 → 单选：「一长三短」选最长，否则随机
+    if (!optViews.count) {
+        BOOL oneLong = NO;
+        if (options.count >= 3) {
+            NSMutableArray *lens = [NSMutableArray array];
+            for (NSArray *p in options) [lens addObject:@([p[0] length])];
+            NSArray *sorted = [lens sortedArrayUsingSelector:@selector(compare:)];
+            NSUInteger maxLen = [sorted.lastObject unsignedIntegerValue];
+            NSUInteger second = [sorted[sorted.count - 2] unsignedIntegerValue];
+            if (second > 0 && maxLen >= second * 2) oneLong = YES;   // 最长 ≥ 次长×2 才算「一长三短」
+        }
+        if (oneLong) {
+            NSString *bestText = nil; UIView *bestView = nil; NSUInteger bestLen = 0;
+            for (NSArray *p in options) {
+                NSString *t = p[0];
+                if (isAffirmativeSentence(t)) continue;
+                if (t.length > bestLen) { bestLen = t.length; bestText = t; bestView = p[1]; }
+            }
+            if (!bestView) {
+                for (NSArray *p in options) {
+                    NSString *t = p[0];
+                    if (t.length > bestLen) { bestLen = t.length; bestText = t; bestView = p[1]; }
+                }
+            }
+            if (bestView) { [optViews addObject:bestView]; [optTexts addObject:bestText]; }
+            aaLog(@"⑤ 单选「一长三短」→ 选最长：%@", bestText ?: @"");
+        }
+        if (!optViews.count) {
+            NSArray *p = options[arc4random_uniform((uint32_t)options.count)];
+            [optViews addObject:p[1]]; [optTexts addObject:p[0]];
+            aaLog(@"⑤ 题干无数字 → 单选随机：%@", p[0]);
         }
     }
 
@@ -809,6 +803,5 @@ static void tick(void) {
     [NSTimer scheduledTimerWithTimeInterval:0.2
                                     repeats:YES
                                       block:^(NSTimer *t){ tick(); }];
-    aaLog(@"插件已加载（原生控件树读字 + 题库比对作答），内置题库 %lu 条\n默认关闭（点悬浮球开启）",
-          (unsigned long)(gBank ? gBank.count : 0));
+    aaLog(@"插件已加载（题面规则作答：以上都对直接选 / 哪N多选 / 数字+个种项多选 / 数字3和4 / 一长三短选最长 / 无数字随机）\n默认关闭（点悬浮球开启）");
 }
