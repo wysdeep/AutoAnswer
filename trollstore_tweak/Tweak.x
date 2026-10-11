@@ -355,59 +355,76 @@ static NSString *questionKey(NSString *combined) {
     return best;
 }
 
-// ---------------- 点击 ----------------
+// ---------------- 点击（已加固：绝不因点击崩溃） ----------------
 static void tapView(UIView *view) {
-    if ([view isKindOfClass:[UIControl class]]) {
-        [(UIControl *)view sendActionsForControlEvents:UIControlEventTouchUpInside];
-        return;
-    }
-    for (UIGestureRecognizer *g in view.gestureRecognizers) {
-        if ([g isKindOfClass:[UITapGestureRecognizer class]]) {
-            id target = [g valueForKey:@"_target"];
-            SEL action = NULL;
-            Ivar aIvar = class_getInstanceVariable(object_getClass(g), "_action");
-            if (aIvar) {
-                uintptr_t *pp = (uintptr_t *)((uintptr_t)(__bridge void *)g + ivar_getOffset(aIvar));
-                action = (SEL)(*pp);
-            }
-            if (target && action) {
-                ((void(*)(id, SEL, id))objc_msgSend)(target, action, g);
+    if (!view) return;
+    @try {
+        // 1) 本身是 UIControl（按钮等）→ 直接触发，最安全
+        if ([view isKindOfClass:[UIControl class]]) {
+            [(UIControl *)view sendActionsForControlEvents:UIControlEventTouchUpInside];
+            return;
+        }
+        // 2) 中心命中测试找子 UIControl（很多选项是按钮包在容器里）
+        CGRect r = view.bounds;
+        if (r.size.width > 0 && r.size.height > 0) {
+            UIView *hit = [view hitTest:CGPointMake(r.size.width/2, r.size.height/2) withEvent:nil];
+            if (hit && hit != view && [hit isKindOfClass:[UIControl class]]) {
+                [(UIControl *)hit sendActionsForControlEvents:UIControlEventTouchUpInside];
                 return;
             }
         }
+        // 3) 兜底：手势 target/action（最不安全，做足防护再调用）
+        for (UIGestureRecognizer *g in view.gestureRecognizers) {
+            if (![g isKindOfClass:[UITapGestureRecognizer class]]) continue;
+            id target = nil;
+            @try { target = [g valueForKey:@"_target"]; } @catch (id) { target = nil; }
+            SEL action = NULL;
+            Ivar aIvar = class_getInstanceVariable(object_getClass(g), "_action");
+            if (aIvar) {
+                // 用 object_getIvar 安全取值，避免手动算偏移解引用野指针
+                action = (SEL)object_getIvar(g, aIvar);
+            }
+            if (target && action && [target respondsToSelector:action]) {
+                ((void(*)(id,SEL,id))objc_msgSend)(target, action, g);
+                return;
+            }
+        }
+    } @catch (NSException *e) {
+        aaLog(@"[异常] tapView 跳过：%@", e);
     }
-    // 兜底：命中测试到子视图再试
-    CGRect r = view.bounds;
-    UIView *hit = [view hitTest:CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)) withEvent:nil];
-    if (hit && hit != view) tapView(hit);
 }
 
 // ---------------- 提交后循环重提（遇「火爆/繁忙」） ----------------
 // 用普通 C 函数递归（避免 block 自捕获导致的 retain cycle）
 static void retrySubmitIfBusy(UIView *confirm, NSInteger left) {
-    NSMutableString *all2 = [NSMutableString string];
-    NSMutableArray *tap2 = [NSMutableArray array];
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-            if ([s isKindOfClass:[UIWindowScene class]] &&
-                ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *w in ((UIWindowScene *)s).windows)
-                    if (!w.isHidden && w.alpha > 0.01) collectViews(w, all2, tap2);
+    @try {
+        NSMutableString *all2 = [NSMutableString string];
+        NSMutableArray *tap2 = [NSMutableArray array];
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]] &&
+                    ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
+                    for (UIWindow *w in ((UIWindowScene *)s).windows)
+                        if (!w.isHidden && w.alpha > 0.01) collectViews(w, all2, tap2);
+                }
             }
         }
-    }
-    BOOL busy = NO;
-    for (NSString *k in @[@"火爆",@"繁忙",@"失败",@"稍后",@"重试",@"超时",@"抢不到",@"人太多",@"网络"]) {
-        if ([all2 containsString:k]) { busy = YES; break; }
-    }
-    UIView *confirm2 = findConfirmButton(tap2);
-    if (busy && confirm2 && left > 0) {
-        aaLog(@"检测到提交繁忙，重提（剩 %ld 次）", (long)left);
-        tapView(confirm2);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(rnd(0.4, 0.7) * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ retrySubmitIfBusy(confirm2, left - 1); });
-    } else {
-        aaLog(@"提交流程结束（busy=%d, left=%ld）", busy, (long)left);
+        BOOL busy = NO;
+        for (NSString *k in @[@"火爆",@"繁忙",@"失败",@"稍后",@"重试",@"超时",@"抢不到",@"人太多",@"网络"]) {
+            if ([all2 containsString:k]) { busy = YES; break; }
+        }
+        UIView *confirm2 = findConfirmButton(tap2);
+        if (busy && confirm2 && left > 0) {
+            aaLog(@"检测到提交繁忙，重提（剩 %ld 次）", (long)left);
+            tapView(confirm2);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(rnd(0.4, 0.7) * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ retrySubmitIfBusy(confirm2, left - 1); });
+        } else {
+            aaLog(@"提交流程结束（busy=%d, left=%ld）", busy, (long)left);
+            gWorking = NO;
+        }
+    } @catch (NSException *e) {
+        aaLog(@"[异常] 重提流程：%@", e);
         gWorking = NO;
     }
 }
@@ -606,8 +623,8 @@ static void tick(void) {
             NSString *txt = optTexts[i];
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(offset * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
-                tapView(v);
-                aaLog(@"已选：%@", txt);
+                @try { tapView(v); aaLog(@"已选：%@", txt); }
+                @catch (NSException *e) { aaLog(@"[异常] 选项点击：%@", e); }
             });
         }
         double confirmAt = offset + rnd(kConfirmMin, kConfirmMax);
@@ -615,7 +632,10 @@ static void tick(void) {
                        dispatch_get_main_queue(), ^{
             doSubmit();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ retrySubmitIfBusy(confirm, 8); });
+                           dispatch_get_main_queue(), ^{
+                @try { retrySubmitIfBusy(confirm, 8); }
+                @catch (NSException *e) { aaLog(@"[异常] 重提：%@", e); gWorking = NO; }
+            });
         });
     });
     } @catch (NSException *e) {
