@@ -368,6 +368,36 @@ static void tapView(UIView *view) {
     if (hit && hit != view) tapView(hit);
 }
 
+// ---------------- 提交后循环重提（遇「火爆/繁忙」） ----------------
+// 用普通 C 函数递归（避免 block 自捕获导致的 retain cycle）
+static void retrySubmitIfBusy(UIView *confirm, NSInteger left) {
+    NSMutableString *all2 = [NSMutableString string];
+    NSMutableArray *tap2 = [NSMutableArray array];
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]] &&
+                ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
+                for (UIWindow *w in ((UIWindowScene *)s).windows)
+                    if (!w.isHidden && w.alpha > 0.01) collectViews(w, all2, tap2);
+            }
+        }
+    }
+    BOOL busy = NO;
+    for (NSString *k in @[@"火爆",@"繁忙",@"失败",@"稍后",@"重试",@"超时",@"抢不到",@"人太多",@"网络"]) {
+        if ([all2 containsString:k]) { busy = YES; break; }
+    }
+    UIView *confirm2 = findConfirmButton(tap2);
+    if (busy && confirm2 && left > 0) {
+        aaLog(@"检测到提交繁忙，重提（剩 %ld 次）", (long)left);
+        tapView(confirm2);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(rnd(0.4, 0.7) * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ retrySubmitIfBusy(confirm2, left - 1); });
+    } else {
+        aaLog(@"提交流程结束（busy=%d, left=%ld）", busy, (long)left);
+        gWorking = NO;
+    }
+}
+
 // ---------------- 主循环 ----------------
 static void tick(void) {
     // 悬浮球懒创建：必须放在所有提前 return 之前（无条件创建），
@@ -497,8 +527,9 @@ static void tick(void) {
         }
         if (!bestView) {
             for (NSArray *p in candidates) {
-                NSUInteger L = p[0].length;
-                if (L > bestLen) { bestLen = L; bestText = p[0]; bestView = p[1]; }
+                NSString *t0 = p[0];
+                NSUInteger L = t0.length;
+                if (L > bestLen) { bestLen = L; bestText = t0; bestView = p[1]; }
             }
         }
         if (bestView) { [optViews addObject:bestView]; [optTexts addObject:bestText]; }
@@ -516,34 +547,6 @@ static void tick(void) {
     void (^doSubmit)(void) = ^{
         if (confirm) { tapView(confirm); aaLog(@"已点「确认提交」"); }
         else         { aaLog(@"未找到确认按钮，跳过提交"); }
-    };
-    __block void (^retryIfBusy)(NSInteger);
-    retryIfBusy = ^(NSInteger left) {
-        NSMutableString *all2 = [NSMutableString string];
-        NSMutableArray *tap2 = [NSMutableArray array];
-        if (@available(iOS 13.0, *)) {
-            for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-                if ([s isKindOfClass:[UIWindowScene class]] &&
-                    ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
-                    for (UIWindow *w in ((UIWindowScene *)s).windows)
-                        if (!w.isHidden && w.alpha > 0.01) collectViews(w, all2, tap2);
-                }
-            }
-        }
-        BOOL busy = NO;
-        for (NSString *k in @[@"火爆",@"繁忙",@"失败",@"稍后",@"重试",@"超时",@"抢不到",@"人太多",@"网络"]) {
-            if ([all2 containsString:k]) { busy = YES; break; }
-        }
-        UIView *confirm2 = findConfirmButton(tap2);
-        if (busy && confirm2 && left > 0) {
-            aaLog(@"检测到提交繁忙，重提（剩 %ld 次）", (long)left);
-            tapView(confirm2);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(rnd(0.4, 0.7) * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ retryIfBusy(left - 1); });
-        } else {
-            aaLog(@"提交流程结束（busy=%d, left=%ld）", busy, (long)left);
-            gWorking = NO;
-        }
     };
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(reading * NSEC_PER_SEC)),
@@ -564,7 +567,7 @@ static void tick(void) {
                        dispatch_get_main_queue(), ^{
             doSubmit();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ retryIfBusy(8); });
+                           dispatch_get_main_queue(), ^{ retrySubmitIfBusy(confirm, 8); });
         });
     });
 }
