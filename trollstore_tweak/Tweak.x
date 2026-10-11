@@ -2,12 +2,12 @@
 //
 // 功能：
 //   1. 悬浮球手动开关（默认关，点一下切换 开/关）——不会上来就自动跑，由你控制时机
-//   2. 读题（视图树取文字，无 OCR）→ 本地题库匹配 → 模拟手速点选选项
-//   3. 多选题自动依次点多个选项（间隔随机）
-//   4. 选项点完自动点「确认提交」
-//   5. 全程随机延迟模拟真人，降低风控特征
-//   6. 【新】屏幕出现「以上都是 / 以上都对…」选项时，默认必选该项
-//   7. 【新】题库可随时编辑：app 沙盒 Documents/AutoAnswer_questions.json，改完 0.2s 内热更新，无需重装
+//   2. 读题（视图树取文字，无 OCR）→ 启发式自动选（不依赖题库，按界面文字规律）
+//   3. 单选：出现「以上都是/以上都对」必选该项；否则选文字最长的选项（排除肯定句陷阱）
+//   4. 多选：题面「以下N个」→ 选 N 个（N≥选项数则全选，否则随机 N 个）
+//   5. 选项点完自动点「确认提交」；若提示「火爆/繁忙/失败」则循环重提直至成功
+//   6. 全程随机延迟模拟真人，降低风控特征
+//   7. 题库仍可在 Documents/AutoAnswer_questions.json 编辑，但已非必须（启发式优先）
 //
 // 注入：Theos + ellekit 编译 dylib → TrollFools 注入淘宝 → TrollStore 安装
 
@@ -318,6 +318,17 @@ static UIView *findConfirmButton(NSArray *tappables) {
     return nil;
 }
 
+// ---------------- 肯定句判定（单选题里这类多为陷阱，不选） ----------------
+static BOOL isAffirmativeSentence(NSString *t) {
+    if (![t isKindOfClass:[NSString class]] || t.length == 0) return NO;
+    // 绝对化/送分型陈述：命中且像"一句话"时才视为肯定句，避免误杀短术语答案
+    NSArray *markers = @[@"确实",@"当然",@"肯定",@"毫无疑问",@"没错",@"是的",
+                         @"对，",@"就是这样",@"一定",@"绝对",@"毫无疑问地"];
+    for (NSString *m in markers)
+        if ([t containsString:m] && (t.length > 8 || [t containsString:@"。"])) return YES;
+    return NO;
+}
+
 // ---------------- 题目标识（取带问号的最长文本） ----------------
 static NSString *questionKey(NSString *combined) {
     NSString *best = nil;
@@ -417,43 +428,123 @@ static void tick(void) {
               (unsigned long)answers.count, (unsigned long)allAbove.count);
     }
 
-    // === 新特性①：屏幕出现「以上都是」则默认必选 ===
+    // ===== 启发式自动作答（不依赖题库，按界面文字规律选） =====
+    UIView *confirm = findConfirmButton(tappables);
+
+    // 1) 收集"候选选项"：所有可点项，去掉确认按钮、悬浮球、常见非选项按钮
+    static NSArray *nonOptionWords = nil;
+    static dispatch_once_t onceNon;
+    dispatch_once(&onceNon, ^{
+        nonOptionWords = @[@"返回",@"关闭",@"首页",@"我的",@"购物车",@"分享",@"举报",@"客服",
+                           @"下一题",@"上一题",@"跳过",@"换一换",@"更多",@"知道了",@"确定",@"取消"];
+    });
+    NSMutableArray *candidates = [NSMutableArray array];
+    for (NSArray *p in tappables) {
+        if (p.count < 2) continue;
+        if (p[1] == confirm) continue;
+        if (gToggleBtn && p[1] == gToggleBtn) continue;
+        NSString *t = p[0];
+        BOOL skip = NO;
+        for (NSString *w in nonOptionWords) if ([t containsString:w]) { skip = YES; break; }
+        if (skip) continue;
+        [candidates addObject:p];
+    }
+
+    // 2) 题型识别：题面"以下N个" → 多选且选 N 个
+    BOOL isMulti = NO; NSInteger needN = 0;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"以下\\s*(\\d+)\\s*个"
+                                                                          options:0 error:nil];
+    NSArray *ms = [re matchesInString:all options:0 range:NSMakeRange(0, all.length)];
+    if (ms.count) {
+        isMulti = YES;
+        NSString *num = [all substringWithRange:[ms.lastObject rangeAtIndex:1]];
+        needN = [num integerValue];
+    }
 
     NSMutableArray *optViews = [NSMutableArray array];
     NSMutableArray *optTexts = [NSMutableArray array];
 
     if (allAbove.count > 0) {
-        // 默认必选：只点「以上都是」这一项（不再叠加题库其他答案，避免重复点击互相取消）
+        // 「以上都是 / 以上都对」家族：无论单多选都优先必选
         for (NSArray *p in allAbove) {
-            if (![optTexts containsObject:p[0]]) {
-                [optViews addObject:p[1]];
-                [optTexts addObject:p[0]];
-            }
+            if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
         }
         aaLog(@"命中「以上都是」默认必选，共 %lu 项", (unsigned long)optViews.count);
+    } else if (isMulti) {
+        NSMutableArray *pool = [NSMutableArray arrayWithArray:candidates];
+        if (needN <= 0 || needN >= (NSInteger)pool.count) {
+            for (NSArray *p in pool) {
+                if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
+            }
+            aaLog(@"多选：全选 %lu 项（needN=%ld, 选项数=%lu）", (unsigned long)optViews.count, (long)needN, (unsigned long)pool.count);
+        } else {
+            while (optViews.count < needN && pool.count) {
+                NSUInteger idx = arc4random_uniform((uint32_t)pool.count);
+                NSArray *p = pool[idx];
+                [pool removeObjectAtIndex:idx];
+                if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
+            }
+            aaLog(@"多选：随机选 %lu 项（needN=%ld）", (unsigned long)optViews.count, (long)needN);
+        }
     } else {
-        if (!answers.count || answers.count > 4) return;
-        for (NSString *ans in answers) {
-            for (NSArray *p in tappables) {
-                NSString *t = p[0];
-                if ([t isEqualToString:ans] || [t containsString:ans]) {
-                    if (![optTexts containsObject:t]) {
-                        [optViews addObject:p[1]];
-                        [optTexts addObject:t];
-                    }
-                    break;
-                }
+        // 单选：选文字最长项（排除肯定句；全被排除则退化选最长）
+        NSString *bestText = nil; UIView *bestView = nil; NSUInteger bestLen = 0;
+        for (NSArray *p in candidates) {
+            NSString *t = p[0];
+            if (isAffirmativeSentence(t)) continue;
+            NSUInteger L = t.length;
+            if (L > bestLen) { bestLen = L; bestText = t; bestView = p[1]; }
+        }
+        if (!bestView) {
+            for (NSArray *p in candidates) {
+                NSUInteger L = p[0].length;
+                if (L > bestLen) { bestLen = L; bestText = p[0]; bestView = p[1]; }
             }
         }
+        if (bestView) { [optViews addObject:bestView]; [optTexts addObject:bestText]; }
+        aaLog(@"单选：选最长项（%lu 字符）%@", (unsigned long)bestLen, bestText ?: @"");
     }
-    if (!optViews.count) return;
-    UIView *confirm = findConfirmButton(tappables);
 
-    // ===== 模拟手速：看题 → 逐个点选项（随机间隔）→ 点确认提交 =====
+    if (!optViews.count) return;
+
+    // ===== 模拟手速：看题 → 逐个点选项（随机间隔）→ 点确认提交 → 火爆则循环重提 =====
     gWorking = YES;
     [gDoneQ addObject:qkey];
     double reading = rnd(kReadingMin, kReadingMax);
-    aaLog(@"命中 %@，看题 %.1fs", optTexts, reading);
+    aaLog(@"作答 %@，看题 %.1fs", optTexts, reading);
+
+    void (^doSubmit)(void) = ^{
+        if (confirm) { tapView(confirm); aaLog(@"已点「确认提交」"); }
+        else         { aaLog(@"未找到确认按钮，跳过提交"); }
+    };
+    __block void (^retryIfBusy)(NSInteger);
+    retryIfBusy = ^(NSInteger left) {
+        NSMutableString *all2 = [NSMutableString string];
+        NSMutableArray *tap2 = [NSMutableArray array];
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]] &&
+                    ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
+                    for (UIWindow *w in ((UIWindowScene *)s).windows)
+                        if (!w.isHidden && w.alpha > 0.01) collectViews(w, all2, tap2);
+                }
+            }
+        }
+        BOOL busy = NO;
+        for (NSString *k in @[@"火爆",@"繁忙",@"失败",@"稍后",@"重试",@"超时",@"抢不到",@"人太多",@"网络"]) {
+            if ([all2 containsString:k]) { busy = YES; break; }
+        }
+        UIView *confirm2 = findConfirmButton(tap2);
+        if (busy && confirm2 && left > 0) {
+            aaLog(@"检测到提交繁忙，重提（剩 %ld 次）", (long)left);
+            tapView(confirm2);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(rnd(0.4, 0.7) * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ retryIfBusy(left - 1); });
+        } else {
+            aaLog(@"提交流程结束（busy=%d, left=%ld）", busy, (long)left);
+            gWorking = NO;
+        }
+    };
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(reading * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -471,13 +562,9 @@ static void tick(void) {
         double confirmAt = offset + rnd(kConfirmMin, kConfirmMax);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(confirmAt * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (confirm) {
-                tapView(confirm);
-                aaLog(@"已点「确认提交」");
-            } else {
-                aaLog(@"未找到确认按钮，跳过提交");
-            }
-            gWorking = NO;
+            doSubmit();
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ retryIfBusy(8); });
         });
     });
 }
