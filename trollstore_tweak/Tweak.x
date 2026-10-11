@@ -4,7 +4,7 @@
 //   1. 悬浮球手动开关（默认关，点一下切换 开/关）——不会上来就自动跑，由你控制时机
 //   2. 读题（视图树取文字，无 OCR）→ 启发式自动选（不依赖题库，按界面文字规律）
 //   3. 单选：出现「以上都是/以上都对」必选该项；否则选文字最长的选项（排除肯定句陷阱）
-//   4. 多选：题面「以下N个」→ 选 N 个（N≥选项数则全选，否则随机 N 个）
+//   4. 多选：题面出现「数字+个/种/项」才是多选——看到4全选、3随机选3、2随机选2；无数字一律单选
 //   5. 选项点完自动点「确认提交」；若提示「火爆/繁忙/失败」则循环重提直至成功
 //   6. 全程随机延迟模拟真人，降低风控特征
 //   7. 题库仍可在 Documents/AutoAnswer_questions.json 编辑，但已非必须（启发式优先）
@@ -480,16 +480,20 @@ static void tick(void) {
         [candidates addObject:p];
     }
 
-    // 2) 题型识别：题面"以下N个" → 多选且选 N 个
+    // 2) 题型识别：题面出现「数字+个/种/项」才是多选
+    //    看到 4 → 全选；看到 3 → 随机选3；看到 2 → 随机选2；没有数字 → 一律单选
     BOOL isMulti = NO; NSInteger needN = 0;
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"以下\\s*(\\d+)\\s*个"
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(\\d)\\s*[个种项]"
                                                                           options:0 error:nil];
     NSArray *ms = [re matchesInString:all options:0 range:NSMakeRange(0, all.length)];
-    if (ms.count) {
-        isMulti = YES;
-        NSString *num = [all substringWithRange:[ms.lastObject rangeAtIndex:1]];
-        needN = [num integerValue];
+    NSInteger best = 0;
+    for (NSTextCheckingResult *m in ms) {
+        NSInteger d = [[all substringWithRange:[m rangeAtIndex:1]] integerValue];
+        if (d == 4) { best = 4; break; }      // 4 最高优先：全选
+        if (d == 3 && best < 3) best = 3;
+        if (d == 2 && best < 2) best = 2;
     }
+    if (best > 0) { isMulti = YES; needN = best; }
 
     NSMutableArray *optViews = [NSMutableArray array];
     NSMutableArray *optTexts = [NSMutableArray array];
