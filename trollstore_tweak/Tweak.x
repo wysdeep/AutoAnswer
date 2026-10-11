@@ -272,24 +272,9 @@ static void scanWebViews(UIView *v) {
     if ((wk  && [v isKindOfClass:wk])  || (uiw && [v isKindOfClass:uiw])) gWebViewCount++;
     for (UIView *c in v.subviews) scanWebViews(c);
 }
-// 当原生读不到文字且屏上有 WebView 时，尝试用 JS 读 DOM 文字（只读，不点），验证「WebView 读取方案」可行性
-static void tryReadWebViewDOM(UIView *v) {
-    if (!v) return;
-    Class wk = NSClassFromString(@"WKWebView");
-    if (wk && [v isKindOfClass:wk]) {
-        SEL sel = NSSelectorFromString(@"evaluateJavaScript:completionHandler:");
-        if ([v respondsToSelector:sel]) {
-            NSString *js = @"(function(){var t=document.body?document.body.innerText:'';if(!t&&document.documentElement)t=document.documentElement.innerText;return (t||'').slice(0,300);})()";
-            void(^h)(id,id) = ^(id res, id err){
-                NSString *txt = [res isKindOfClass:[NSString class]] ? res : [res description];
-                aaLog(@"[诊断-WK] DOM可读=%@ 文字:%@", err?@"否":@"是",
-                      [txt length]>200?[[txt substringToIndex:200]stringByAppendingString:@"..."]:txt);
-            };
-            ((void(*)(id,SEL,id,id))objc_msgSend)(v, sel, js, h);
-        }
-    }
-    for (UIView *c in v.subviews) tryReadWebViewDOM(c);
-}
+// 注意：早期版本曾在此对屏上每个 WKWebView 自动跑 evaluateJavaScript 读 DOM，
+// 会在淘宝主页大量 WebView 未就绪时导致 App 闪退，已移除。WebView 读取方案改为
+// 仅在确认题目出现后、且用 @try/@catch 包裹时再谨慎调用。
 
 // ---------------- 题库匹配（答案必须出现在界面 + 关键词命中） ----------------
 // 返回需要点击的选项文字数组（多选返回多个）
@@ -439,6 +424,7 @@ static void tick(void) {
     }
 
     if (!gEnabled || gWorking) return;
+    @try {
 
     // 题库热更新（每轮询检查一次外部文件，改了立即生效）
     reloadBankIfNeeded();
@@ -487,18 +473,8 @@ static void tick(void) {
                   (long)gWebViewCount, hasQ?@"是":@"否");
             if (all.length < 2) {
                 if (gWebViewCount > 0) {
-                    aaLog(@"[诊断] 原生读不到文字但屏上有 %ld 个网页视图 → 强烈怀疑答题界面是网页(WebView)渲染，原生 UILabel 读不到；下面尝试用 JS 读 DOM",
+                    aaLog(@"[诊断] 原生读不到文字但屏上有 %ld 个网页视图 → 强烈怀疑答题界面是网页(WebView)渲染，原生 UILabel 读不到文字",
                           (long)gWebViewCount);
-                    if (@available(iOS 13.0, *)) {
-                        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-                            if (![s isKindOfClass:[UIWindowScene class]]) continue;
-                            if (((UIWindowScene *)s).activationState != UISceneActivationStateForegroundActive) continue;
-                            for (UIWindow *w in ((UIWindowScene *)s).windows)
-                                if (!w.isHidden && w.alpha > 0.01) tryReadWebViewDOM(w);
-                        }
-                    } else {
-                        tryReadWebViewDOM(UIApplication.sharedApplication.keyWindow);
-                    }
                 } else {
                     aaLog(@"[诊断] 原生读不到文字且无网页视图 → 可能：不是淘宝主App / dylib 未注入 / 答题页不在前台 / 开关没开");
                 }
@@ -642,6 +618,9 @@ static void tick(void) {
                            dispatch_get_main_queue(), ^{ retrySubmitIfBusy(confirm, 8); });
         });
     });
+    } @catch (NSException *e) {
+        aaLog(@"[异常] tick 抛出异常：%@", e);
+    }
 }
 
 %ctor {
