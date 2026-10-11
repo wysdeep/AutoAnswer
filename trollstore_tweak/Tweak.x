@@ -428,6 +428,21 @@ static void tick(void) {
     } else {
         collectViews(UIApplication.sharedApplication.keyWindow, all, tappables);
     }
+    // 诊断日志（开启时每 2 秒一条，无条件必打）：屏上文字 0 字符 → 多半是答题界面用网页/画布渲染，读不到原生文字
+    {
+        static NSDate *gLastDiag2 = nil;
+        NSDate *now = [NSDate date];
+        if (!gLastDiag2 || [now timeIntervalSinceDate:gLastDiag2] > 2.0) {
+            gLastDiag2 = now;
+            BOOL hasQ = NO;
+            for (NSString *ln in [all componentsSeparatedByString:@"\n"])
+                if ([ln containsString:@"？"] || [ln containsString:@"?"]) { hasQ = YES; break; }
+            aaLog(@"[诊断] 屏上文字 %lu 字符 / 可点项 %lu 个 / 有问号=%@%@",
+                  (unsigned long)all.length, (unsigned long)tappables.count, hasQ?@"是":@"否",
+                  all.length < 2 ? @"（读不到文字→可能答题界面是网页/画布渲染，插件无法作答）":@"");
+        }
+    }
+
     if (all.length < 2) return;
 
     NSArray *answers = matchAnswers(all);
@@ -447,16 +462,6 @@ static void tick(void) {
         [gDoneQ removeAllObjects];
     }
     if ([gDoneQ containsObject:qkey]) return; // 这道题已经处理过，不重复点（防重复提交）
-
-    // 诊断日志（开启时每 2 秒一条，写文件）：看清插件读到了什么、命中了几条
-    static NSDate *gLastDiag = nil;
-    NSDate *now = [NSDate date];
-    if (!gLastDiag || [now timeIntervalSinceDate:gLastDiag] > 2.0) {
-        gLastDiag = now;
-        aaLog(@"[诊断] 屏上文字 %lu 字符 / 可点项 %lu 个 / 命中答案 %lu 条 / 以上都是 %lu 项",
-              (unsigned long)all.length, (unsigned long)tappables.count,
-              (unsigned long)answers.count, (unsigned long)allAbove.count);
-    }
 
     // ===== 启发式自动作答（不依赖题库，按界面文字规律选） =====
     UIView *confirm = findConfirmButton(tappables);
