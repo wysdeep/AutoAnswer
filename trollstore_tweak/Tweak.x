@@ -238,7 +238,7 @@ static void collectViews(UIView *view, NSMutableString *allTexts, NSMutableArray
         [allTexts appendFormat:@"%@\n", t];
         CGRect wf = [view convertRect:view.bounds toView:nil];
         id wnd = view.window ?: (id)[NSNull null];
-        [textFrames addObject:@[t, [NSValue valueWithCGRect:wf], wnd]];
+        [textFrames addObject:@[t, [NSValue valueWithCGRect:wf], wnd, view]];
     }
     for (UIView *c in view.subviews) collectViews(c, allTexts, textFrames);
 }
@@ -313,17 +313,8 @@ static void scanScreen(NSMutableString *all, NSMutableArray *tappables, NSMutabl
     [tappables addObjectsFromArray:best.allValues];
 }
 
-// ---------------- 网页视图检测（诊断用） ----------------
-static NSInteger gWebViewCount = 0;
-static void scanWebViews(UIView *v) {
-    if (!v) return;
-    Class wk  = NSClassFromString(@"WKWebView");
-    Class uiw = NSClassFromString(@"UIWebView");
-    if ((wk  && [v isKindOfClass:wk])  || (uiw && [v isKindOfClass:uiw])) gWebViewCount++;
-    for (UIView *c in v.subviews) scanWebViews(c);
-}
-
 // ---------------- 找确认按钮（提交/确认/我知道了/确定…） ----------------
+// 注：答题选项为原生 UITextView 控件（非图片、非 WebView），直接读控件树文字即可。
 static UIView *findConfirmBtn(NSArray *tappables, CGRect *outFrame) {
     static NSArray *markers = nil;
     static dispatch_once_t once;
@@ -431,83 +422,8 @@ static void retrySubmitIfBusy(UIView *confirm, NSInteger left) {
     }
 }
 
-// ---------------- WebView(H5) 答题弹窗探测与作答 ----------------
-// 日志已证实：答题抢红包弹窗是 H5(WebView) 渲染，原生 UILabel/UIButton 读不到其按钮与选项。
-// 这里安全读取可见且已加载完成的 WKWebView 的 DOM，识别选项并点击、点"确认提交"。
-static void collectWebViews(UIView *v, NSMutableArray *out) {
-    if (!v) return;
-    Class wk = NSClassFromString(@"WKWebView");
-    if (wk && [v isKindOfClass:wk]) {
-        WKWebView *wv = (WKWebView *)v;
-        if (!wv.isLoading && !wv.hidden && wv.alpha > 0.01 && wv.window) [out addObject:wv];
-    }
-    for (UIView *c in v.subviews) collectWebViews(c, out);
-}
-
-static void webViewRunJS(WKWebView *wv, NSString *js, void (^cb)(NSString *)) {
-    @try {
-        if (!wv || wv.isLoading || !wv.window) { if (cb) cb(nil); return; }
-        [wv evaluateJavaScript:js completionHandler:^(id res, NSError *err){
-            if (err) { if (cb) cb(nil); return; }
-            if (cb) cb(res ? [NSString stringWithFormat:@"%@", res] : @"");
-        }];
-    } @catch (NSException *e) {
-        if (cb) cb(nil);
-    }
-}
-
-static void tryWebViewQuiz(void) {
-    @try {
-        static NSDate *gLastWeb = nil;
-        NSDate *now = [NSDate date];
-        if (gLastWeb && [now timeIntervalSinceDate:gLastWeb] < 0.6) return;  // 节流，避免狂刷
-        gLastWeb = now;
-
-        NSMutableArray *wvs = [NSMutableArray array];
-        if (@available(iOS 13.0, *)) {
-            for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-                if ([s isKindOfClass:[UIWindowScene class]] &&
-                    ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
-                    for (UIWindow *w in ((UIWindowScene *)s).windows)
-                        if (!w.isHidden && w.alpha > 0.01) collectWebViews(w, wvs);
-                }
-            }
-        }
-        if (wvs.count == 0) return;
-
-        for (WKWebView *wv in wvs) {
-            // 先读 DOM 文字，判断是否答题弹窗
-            webViewRunJS(wv, @"document.body.innerText", ^(NSString *txt){
-                if (!txt) return;
-                BOOL isQuiz = ([txt containsString:@"确认提交"] || [txt containsString:@"提交答案"] ||
-                              ([txt containsString:@"答题"] && [txt containsString:@"剩余"]));
-                if (!isQuiz) return;
-                aaLog(@"[H5答题] 检测到答题弹窗！DOM文字(截断400)：%@",
-                      [txt length] > 400 ? [txt substringToIndex:400] : txt);
-                // 选选项（短文字、可点、非提交/关闭类）+ 点提交，返回 JSON 摘要
-                NSString *js =
-                @"(function(){"
-                 "var all=[].slice.call(document.querySelectorAll('*'));"
-                 "var clickable=all.filter(function(e){var t=(e.innerText||e.textContent||'').trim();"
-                 "return t.length>=1&&t.length<=40&&(e.tagName==='BUTTON'||e.getAttribute('role')==='button'||e.onclick);});"
-                 "var nonSub=/确认提交|提交答案|交卷|提交|知道了|关闭|取消|下一题|跳过|换一换|返回|首页/;"
-                 "var opts=clickable.filter(function(e){return !nonSub.test(e.innerText||e.textContent||'');});"
-                 "var clicked=[];opts.slice(0,8).forEach(function(e){try{e.click();clicked.push((e.innerText||'').trim());}catch(_){}});"
-                 "var btn=clickable.find(function(e){var t=(e.innerText||e.textContent||'');return /确认提交|提交答案|交卷|提交/.test(t)&&t.length<=12;});"
-                 "var sub=btn?(function(){try{btn.click();return 'clicked:'+(btn.innerText||'');}catch(_){return 'err';}})():'no-submit';"
-                 "return JSON.stringify({opts:clicked,submit:sub});"
-                 "})()";
-                webViewRunJS(wv, js, ^(NSString *r){
-                    aaLog(@"[H5答题] 作答结果：%@", r ? r : @"JS无返回");
-                });
-            });
-        }
-    } @catch (NSException *e) {
-        aaLog(@"[异常] tryWebViewQuiz：%@", e);
-    }
-}
-
 // ---------------- 主循环 ----------------
+// 选项为原生 UITextView：直接遍历控件树读文字 → 题库 kw 匹配题干 → 取 a → 在选项候选里找文字匹配的 TextView → 点击。
 static void tick(void) {
     if (!gOverlay) {
         UIWindowScene *sc = nil;
@@ -525,19 +441,6 @@ static void tick(void) {
     NSMutableArray *tappables = [NSMutableArray array];
     NSMutableArray *textFrames = [NSMutableArray array];
     scanScreen(all, tappables, textFrames);
-
-    gWebViewCount = 0;
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-            if ([s isKindOfClass:[UIWindowScene class]] &&
-                ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *w in ((UIWindowScene *)s).windows)
-                    if (!w.isHidden && w.alpha > 0.01) scanWebViews(w);
-            }
-        }
-    } else {
-        scanWebViews(UIApplication.sharedApplication.keyWindow);
-    }
 
     // ===== 定位答题弹窗：以确认按钮为锚点 =====
     static NSArray *nonOptionWords = nil;
@@ -623,9 +526,8 @@ static void tick(void) {
         NSDate *now = [NSDate date];
         if (!gLastDiag2 || [now timeIntervalSinceDate:gLastDiag2] > 2.0) {
             gLastDiag2 = now;
-            aaLog(@"[诊断] 文字%lu 载体%lu 可点%lu 网页%ld | 有题=%@ 确认=%@ 选项%lu 题干=%@",
+            aaLog(@"[诊断] 文字%lu 载体%lu 可点%lu | 有题=%@ 确认=%@ 选项%lu 题干=%@",
                   (unsigned long)all.length, (unsigned long)tappables.count, (unsigned long)options.count,
-                  (long)gWebViewCount,
                   hasQuiz ? @"是" : @"否",
                   confirmText.length ? confirmText : (confirm ? @"有" : @"无"),
                   (unsigned long)options.count, qText.length ? qText : @"-");
@@ -669,19 +571,9 @@ static void tick(void) {
                 }
             }
             if (all.length < 2) {
-                if (gWebViewCount > 0) {
-                    aaLog(@"[诊断] 原生读不到文字但屏上有 %ld 个网页视图 → 可能答题界面是网页(WebView)渲染",
-                          (long)gWebViewCount);
-                } else {
-                    aaLog(@"[诊断] 原生读不到文字且无网页视图 → 可能：不是淘宝主App / dylib 未注入 / 开关没开");
-                }
+                aaLog(@"[诊断] 原生读不到文字 → 可能：不是淘宝主App / dylib 未注入 / 开关没开");
             }
         }
-    }
-
-    // 原生没找到确认钮（答题弹窗是 H5/WebView） → 走 WebView 方案
-    if (!confirm && !gWorking) {
-        tryWebViewQuiz();
     }
 
     if (!hasQuiz || !confirm || options.count < 2) return;
@@ -702,85 +594,167 @@ static void tick(void) {
     }
     if ([gDoneQ containsObject:qkey]) return;
 
-    // ===== 启发式自动作答 =====
+    // ===== 题库比对作答（优先） =====
+    // 选项为原生 UITextView，控件树直接读字，无需 OCR / WebView。
+    // 流程：题干 + 选项 → 逐条用 kw 匹配 → 命中取 a（答案文本/数组）→ 在选项候选里找文字匹配的载体点击。
     NSMutableArray *optViews = [NSMutableArray array];
     NSMutableArray *optTexts = [NSMutableArray array];
 
-    // ① 「以上都是」家族必选
-    NSMutableArray *allAbove = [NSMutableArray array];
-    for (NSArray *p in options) {
-        for (NSString *m in allAboveMarkers())
-            if ([p[0] containsString:m]) { [allAbove addObject:p]; break; }
+    NSMutableString *searchText = [NSMutableString string];   // 题干 + 选项（精准匹配域）
+    if (qText.length) [searchText appendFormat:@"%@\n", qText];
+    {
+        NSMutableArray *ot = [NSMutableArray array];
+        for (NSArray *p in options) [ot addObject:p[0]];
+        [searchText appendFormat:@"%@\n", [ot componentsJoinedByString:@"\n"]];
     }
 
-    if (allAbove.count > 0) {
-        for (NSArray *p in allAbove)
-            if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
-        aaLog(@"命中「以上都是」必选，共 %lu 项", (unsigned long)optViews.count);
-    } else {
-        // ② 多选：题干含「数字+个/种/项」
-        BOOL isMulti = NO; NSInteger needN = 0;
-        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(\\d)\\s*[个种项]"
-                                                                              options:0 error:nil];
-        NSArray *ms = [re matchesInString:qText options:0 range:NSMakeRange(0, qText.length)];
-        NSInteger best = 0;
-        for (NSTextCheckingResult *m in ms) {
-            NSInteger d = [[qText substringWithRange:[m rangeAtIndex:1]] integerValue];
-            if (d == 4) { best = 4; break; }
-            if (d == 3 && best < 3) best = 3;
-            if (d == 2 && best < 2) best = 2;
-        }
-        if (best > 0) { isMulti = YES; needN = best; }
+    // 归一：去空格/制表，便于「7 节」vs「7节」之类匹配
+    NSString *(^norm)(NSString *) = ^(NSString *s){
+        NSMutableString *m = [NSMutableString stringWithString:s ?: @""];
+        [m replaceOccurrencesOfString:@" "  withString:@"" options:0 range:NSMakeRange(0, m.length)];
+        [m replaceOccurrencesOfString:@"\t" withString:@"" options:0 range:NSMakeRange(0, m.length)];
+        return [NSString stringWithString:m];
+    };
 
-        if (isMulti) {
-            NSMutableArray *pool = [NSMutableArray arrayWithArray:options];
-            if (needN >= (NSInteger)pool.count) {
-                for (NSArray *p in pool)
-                    if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
-                aaLog(@"多选：全选 %lu 项（needN=%ld）", (unsigned long)optViews.count, (long)needN);
-            } else {
-                while (optViews.count < needN && pool.count) {
-                    NSUInteger idx = arc4random_uniform((uint32_t)pool.count);
-                    NSArray *p = pool[idx];
-                    [pool removeObjectAtIndex:idx];
-                    if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
+    // 按答案文字找可点载体：先精确匹配，再子串匹配；先在 options 里找，再在原始 TextView/UILabel 里找
+    UIView *(^viewForAnswer)(NSString *) = ^UIView *(NSString *ans){
+        NSString *an = norm(ans);
+        // 第一遍：精确相等（最可靠）
+        for (NSArray *p in options) {
+            if (p.count < 3) continue;
+            if ([norm(p[0]) isEqualToString:an]) return p[1];
+        }
+        for (NSArray *p in textFrames) {
+            if (p.count < 4) continue;
+            if ([norm(p[0]) isEqualToString:an]) return p[3];
+        }
+        // 第二遍：子串包含（任一方向）
+        for (NSArray *p in options) {
+            if (p.count < 3) continue;
+            NSString *ot = norm(p[0]);
+            if ([ot containsString:an] || [an containsString:ot]) return p[1];
+        }
+        for (NSArray *p in textFrames) {
+            if (p.count < 4) continue;
+            NSString *ot = norm(p[0]);
+            if ([ot containsString:an] || [an containsString:ot]) return p[3];
+        }
+        return nil;
+    };
+
+    NSDictionary *hit = nil;
+    NSString *hitKw = nil;
+    if (gBank) {
+        for (NSDictionary *e in gBank) {
+            if (![e isKindOfClass:[NSDictionary class]]) continue;
+            id kws = e[@"kw"] ?: @[];
+            if (![kws isKindOfClass:[NSArray class]]) kws = @[kws];
+            for (NSString *k in kws) {
+                if ([k isKindOfClass:[NSString class]] && k.length && [searchText containsString:k]) {
+                    hit = e; hitKw = k; break;
                 }
-                aaLog(@"多选：随机选 %lu 项（needN=%ld）", (unsigned long)optViews.count, (long)needN);
             }
+            if (hit) break;
+        }
+    }
+
+    if (hit) {
+        id ans = hit[@"a"];
+        NSArray *ansList = [ans isKindOfClass:[NSArray class]] ? ans : @[ans];
+        aaLog(@"题库命中：kw=%@ → 答案=%@（题面：%@）", hitKw, ansList, qText.length ? qText : @"-");
+        for (id a in ansList) {
+            if (![a isKindOfClass:[NSString class]] || ![a length]) continue;
+            UIView *v = viewForAnswer(a);
+            if (v && ![optTexts containsObject:a]) {
+                [optViews addObject:v];
+                [optTexts addObject:(NSString *)a];
+            } else if (!v) {
+                aaLog(@"⚠️ 答案「%@」在选项候选里找不到对应 TextView", a);
+            }
+        }
+        if (optViews.count == 0)
+            aaLog(@"⚠️ 题库命中但选项里无对应文字（答案=%@）→ 回退启发式", ansList);
+    } else {
+        aaLog(@"题库未命中（题面：%@）→ 回退启发式猜答", qText.length ? qText : @"-");
+    }
+
+    // ===== 启发式回退（题库未命中，或命中但找不到对应选项文字） =====
+    if (optViews.count == 0) {
+        // ① 「以上都是」家族必选
+        NSMutableArray *allAbove = [NSMutableArray array];
+        for (NSArray *p in options) {
+            for (NSString *m in allAboveMarkers())
+                if ([p[0] containsString:m]) { [allAbove addObject:p]; break; }
+        }
+        if (allAbove.count > 0) {
+            for (NSArray *p in allAbove)
+                if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
+            aaLog(@"命中「以上都是」必选，共 %lu 项", (unsigned long)optViews.count);
         } else {
-            // ③ 纯数字选项 + 题干数字匹配（含中文数字：三→3）
-            NSInteger n = firstNumeralIn(qText);
-            if (n > 0) {
-                for (NSArray *p in options) {
-                    NSString *t = p[0];
-                    BOOL pureNum = (t.length >= 1 && t.length <= 3);
-                    for (NSUInteger i = 0; pureNum && i < t.length; i++) {
-                        unichar ch = [t characterAtIndex:i];
-                        if (ch < '0' || ch > '9') pureNum = NO;
-                    }
-                    if (pureNum && t.intValue == n) {
-                        [optViews addObject:p[1]]; [optTexts addObject:t];
-                        aaLog(@"数字匹配：题干含数字 %ld → 选「%@」", (long)n, t);
-                        break;
-                    }
-                }
+            // ② 多选：题干含「数字+个/种/项」
+            BOOL isMulti = NO; NSInteger needN = 0;
+            NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(\\d)\\s*[个种项]"
+                                                                                  options:0 error:nil];
+            NSArray *ms = [re matchesInString:qText options:0 range:NSMakeRange(0, qText.length)];
+            NSInteger best = 0;
+            for (NSTextCheckingResult *m in ms) {
+                NSInteger d = [[qText substringWithRange:[m rangeAtIndex:1]] integerValue];
+                if (d == 4) { best = 4; break; }
+                if (d == 3 && best < 3) best = 3;
+                if (d == 2 && best < 2) best = 2;
             }
-            // ④ 单选最长（排除肯定句）
-            if (!optViews.count) {
-                NSString *bestText = nil; UIView *bestView = nil; NSUInteger bestLen = 0;
-                for (NSArray *p in options) {
-                    NSString *t = p[0];
-                    if (isAffirmativeSentence(t)) continue;
-                    if (t.length > bestLen) { bestLen = t.length; bestText = t; bestView = p[1]; }
+            if (best > 0) { isMulti = YES; needN = best; }
+
+            if (isMulti) {
+                NSMutableArray *pool = [NSMutableArray arrayWithArray:options];
+                if (needN >= (NSInteger)pool.count) {
+                    for (NSArray *p in pool)
+                        if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
+                    aaLog(@"多选：全选 %lu 项（needN=%ld）", (unsigned long)optViews.count, (long)needN);
+                } else {
+                    while (optViews.count < needN && pool.count) {
+                        NSUInteger idx = arc4random_uniform((uint32_t)pool.count);
+                        NSArray *p = pool[idx];
+                        [pool removeObjectAtIndex:idx];
+                        if (![optTexts containsObject:p[0]]) { [optViews addObject:p[1]]; [optTexts addObject:p[0]]; }
+                    }
+                    aaLog(@"多选：随机选 %lu 项（needN=%ld）", (unsigned long)optViews.count, (long)needN);
                 }
-                if (!bestView) {
+            } else {
+                // ③ 纯数字选项 + 题干数字匹配（含中文数字：三→3）
+                NSInteger n = firstNumeralIn(qText);
+                if (n > 0) {
                     for (NSArray *p in options) {
                         NSString *t = p[0];
-                        if (t.length > bestLen) { bestLen = t.length; bestText = t; bestView = p[1]; }
+                        BOOL pureNum = (t.length >= 1 && t.length <= 3);
+                        for (NSUInteger i = 0; pureNum && i < t.length; i++) {
+                            unichar ch = [t characterAtIndex:i];
+                            if (ch < '0' || ch > '9') pureNum = NO;
+                        }
+                        if (pureNum && t.intValue == n) {
+                            [optViews addObject:p[1]]; [optTexts addObject:t];
+                            aaLog(@"数字匹配：题干含数字 %ld → 选「%@」", (long)n, t);
+                            break;
+                        }
                     }
                 }
-                if (bestView) { [optViews addObject:bestView]; [optTexts addObject:bestText]; }
-                aaLog(@"单选：选最长项（%lu 字符）%@", (unsigned long)bestLen, bestText ?: @"");
+                // ④ 单选最长（排除肯定句）
+                if (!optViews.count) {
+                    NSString *bestText = nil; UIView *bestView = nil; NSUInteger bestLen = 0;
+                    for (NSArray *p in options) {
+                        NSString *t = p[0];
+                        if (isAffirmativeSentence(t)) continue;
+                        if (t.length > bestLen) { bestLen = t.length; bestText = t; bestView = p[1]; }
+                    }
+                    if (!bestView) {
+                        for (NSArray *p in options) {
+                            NSString *t = p[0];
+                            if (t.length > bestLen) { bestLen = t.length; bestText = t; bestView = p[1]; }
+                        }
+                    }
+                    if (bestView) { [optViews addObject:bestView]; [optTexts addObject:bestText]; }
+                    aaLog(@"单选：选最长项（%lu 字符）%@", (unsigned long)bestLen, bestText ?: @"");
+                }
             }
         }
     }
@@ -835,6 +809,6 @@ static void tick(void) {
     [NSTimer scheduledTimerWithTimeInterval:0.2
                                     repeats:YES
                                       block:^(NSTimer *t){ tick(); }];
-    aaLog(@"插件已加载（反向识别+WebView H5方案），内置题库 %lu 条\n默认关闭（点悬浮球开启）",
+    aaLog(@"插件已加载（原生控件树读字 + 题库比对作答），内置题库 %lu 条\n默认关闭（点悬浮球开启）",
           (unsigned long)(gBank ? gBank.count : 0));
 }
