@@ -477,6 +477,17 @@ static void tick(void) {
             if (p.count >= 3 && p[1] == confirm) { confirmText = p[0]; break; }
     }
 
+    // ===== 答题语境判定：必须出现「答题/红包/剩余/抢答」等字样，才认为在答题弹窗 =====
+    // 否则屏上大量直播间弹幕/聊天会被误当选项（日志已证实旧版因此乱答聊天）
+    BOOL hasQuiz = NO;
+    for (NSArray *p in textFrames) {
+        if (p.count < 3) continue;
+        NSString *tt = p[0];
+        if ([tt containsString:@"答题"] || [tt containsString:@"红包"] ||
+            [tt containsString:@"剩余"] || [tt containsString:@"抢答"] ||
+            [tt containsString:@"答题时间"] || [tt containsString:@"倒计时"]) { hasQuiz = YES; break; }
+    }
+
     // 选项候选：确认按钮上方 520pt 内、同窗口、文字 ≤ 40 字
     NSMutableArray *options = [NSMutableArray array];
     if (confirm) {
@@ -492,6 +503,8 @@ static void tick(void) {
             if (CGRectGetMinY(f) < CGRectGetMinY(confirmFrame) - 520) continue;
             NSString *t = p[0];
             if (t.length == 0 || t.length > 40) continue;
+            // 排除直播间弹幕/聊天（形如「话***: 佳琦…」带冒号或 *** 昵称）
+            if ([t containsString:@":"] || [t containsString:@"***"]) continue;
             BOOL skip = NO;
             for (NSString *w in nonOptionWords) if ([t containsString:w]) { skip = YES; break; }
             if (skip) continue;
@@ -531,9 +544,10 @@ static void tick(void) {
         NSDate *now = [NSDate date];
         if (!gLastDiag2 || [now timeIntervalSinceDate:gLastDiag2] > 2.0) {
             gLastDiag2 = now;
-            aaLog(@"[诊断] 文字%lu 载体%lu 可点%lu 网页%ld | 确认=%@ 选项%lu 题干=%@",
+            aaLog(@"[诊断] 文字%lu 载体%lu 可点%lu 网页%ld | 有题=%@ 确认=%@ 选项%lu 题干=%@",
                   (unsigned long)all.length, (unsigned long)tappables.count, (unsigned long)options.count,
                   (long)gWebViewCount,
+                  hasQuiz ? @"是" : @"否",
                   confirmText.length ? confirmText : (confirm ? @"有" : @"无"),
                   (unsigned long)options.count, qText.length ? qText : @"-");
             if (confirm && options.count < 2) {
@@ -562,7 +576,7 @@ static void tick(void) {
         }
     }
 
-    if (!confirm || options.count < 2) return;
+    if (!hasQuiz || !confirm || options.count < 2) return;
     if (all.length < 2) return;
 
     NSString *qkey = qText;
