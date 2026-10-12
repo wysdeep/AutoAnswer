@@ -492,7 +492,7 @@ static void ensureConfigFile(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) return;
     NSDictionary *def = @{@"api":    @"https://api.deepseek.com/chat/completions",
                           @"key":    @"",
-                          @"model":  @"deepseek-chat",
+                          @"model":  @"deepseek-flash",
                           @"timeout": @1.5};
     NSData *d = [NSJSONSerialization dataWithJSONObject:def
                                                 options:NSJSONWritingPrettyPrinted error:nil];
@@ -547,13 +547,133 @@ static void cacheRemember(NSString *q, NSString *a) {
     } @catch (NSException *e) {}
 }
 
+// ---- 日期题本地规则：选项里挑「未来日期」（严格晚于今天，不含今天）----
+// 李佳琦/淘宝这类题的规律：干扰项都是已经过去的日期，正确答案只有一个（或最早一个）未来日期。
+// 解析出 yyyymmdd；解析不出返回 0
+static int aaParseDate(NSString *s, int curY, int curM, int curD) {
+    @try {
+        if (!s || s.length == 0) return 0;
+        NSRange full = NSMakeRange(0, s.length);
+        int y = 0, m = 0, d = 0;
+        NSRegularExpression *re = nil;
+        NSTextCheckingResult *mm = nil;
+
+        re = [NSRegularExpression regularExpressionWithPattern:@"(\\d{4})\\s*年\\s*(\\d{1,2})\\s*月\\s*(\\d{1,2})\\s*[日号]"
+                                                       options:0 error:nil];
+        mm = [re firstMatchInString:s options:0 range:full];
+        if (mm) {
+            y = [[s substringWithRange:[mm rangeAtIndex:1]] intValue];
+            m = [[s substringWithRange:[mm rangeAtIndex:2]] intValue];
+            d = [[s substringWithRange:[mm rangeAtIndex:3]] intValue];
+        } else {
+            re = [NSRegularExpression regularExpressionWithPattern:@"(\\d{1,2})\\s*月\\s*(\\d{1,2})\\s*[日号]"
+                                                           options:0 error:nil];
+            mm = [re firstMatchInString:s options:0 range:full];
+            if (mm) {
+                y = curY;
+                m = [[s substringWithRange:[mm rangeAtIndex:1]] intValue];
+                d = [[s substringWithRange:[mm rangeAtIndex:2]] intValue];
+            } else {
+                re = [NSRegularExpression regularExpressionWithPattern:@"(\\d{1,2})\\s*[.\\-/]\\s*(\\d{1,2})(?!\\d)"
+                                                               options:0 error:nil];
+                mm = [re firstMatchInString:s options:0 range:full];
+                if (mm) {
+                    y = curY;
+                    m = [[s substringWithRange:[mm rangeAtIndex:1]] intValue];
+                    d = [[s substringWithRange:[mm rangeAtIndex:2]] intValue];
+                }
+            }
+        }
+        if (!y) {                                   // 明天 / 后天 / 大后天
+            int add = 0;
+            if ([s containsString:@"大后天"])      add = 3;
+            else if ([s containsString:@"明天"])   add = 1;
+            else if ([s containsString:@"后天"])   add = 2;
+            if (add > 0) {
+                NSCalendar *cal = [NSCalendar currentCalendar];
+                NSDateComponents *dc = [[NSDateComponents alloc] init];
+                dc.day = add;
+                NSDate *nd = [cal dateByAddingComponents:dc toDate:[NSDate date] options:0];
+                NSDateComponents *c2 = [cal components:NSCalendarUnitYear|NSCalendarUnitMonth|NSCalendarUnitDay
+                                             fromDate:nd];
+                return (int)c2.year * 10000 + (int)c2.month * 100 + (int)c2.day;
+            }
+            return 0;
+        }
+        if (m < 1 || m > 12 || d < 1 || d > 31) return 0;
+        return y * 10000 + m * 100 + d;
+    } @catch (NSException *e) { return 0; }
+}
+
+// 命中返回答案文字，不命中返回 nil。注意：日期题答案随时间变，**绝不写缓存**。
+static NSString *aaDateRuleAnswer(NSString *question, NSArray *opts) {
+    @try {
+        if (!opts || opts.count < 2) return nil;
+        NSCalendar *cal = [NSCalendar currentCalendar];
+        NSDateComponents *c = [cal components:NSCalendarUnitYear|NSCalendarUnitMonth|NSCalendarUnitDay
+                                     fromDate:[NSDate date]];
+        int curY = (int)c.year, curM = (int)c.month, curD = (int)c.day;
+        int today = curY * 10000 + curM * 100 + curD;
+
+        NSMutableArray *future = [NSMutableArray array];    // @[ 文字, yyyymmdd ]
+        int dateCnt = 0;
+        for (id o in opts) {
+            if (![o isKindOfClass:[NSString class]]) continue;
+            NSString *t = (NSString *)o;
+            int v = aaParseDate(t, curY, curM, curD);
+            if (!v) continue;
+            dateCnt++;
+            if (v > today) [future addObject:@[t, @(v)]];
+        }
+        // 至少 2 个选项是日期，且日期选项占到一半以上，才认定这是"日期题"（防价格题误判）
+        if (dateCnt < 2 || dateCnt * 2 < (int)opts.count) return nil;
+        if (future.count == 0) return nil;
+
+        NSArray *sorted = [future sortedArrayUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b){
+            int va = [a[1] intValue], vb = [b[1] intValue];
+            if (va < vb) return NSOrderedAscending;
+            if (va > vb) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+        NSString *qs = question ? question : @"";
+        BOOL wantEarliest = [qs containsString:@"开始"] || [qs containsString:@"开幕"] ||
+                            [qs containsString:@"开抢"] || [qs containsString:@"开售"] ||
+                            [qs containsString:@"首发"] || [qs containsString:@"预售"] ||
+                            [qs containsString:@"启动"] || [qs containsString:@"上线"] ||
+                            [qs containsString:@"首播"] || [qs containsString:@"开播"] ||
+                            [qs containsString:@"首场"] || [qs containsString:@"首次"] ||
+                            [qs containsString:@"哪天"] || [qs containsString:@"哪一天"];
+        BOOL wantLatest   = [qs containsString:@"结束"] || [qs containsString:@"截止"] ||
+                            [qs containsString:@"持续到"] || [qs containsString:@"最后一天"];
+        NSString *pick, *why;
+        if (wantLatest && !wantEarliest) {
+            pick = ((NSArray *)sorted.lastObject)[0];
+            why  = @"题干含「结束/截止」→ 选最晚的未来日期";
+        } else if (wantEarliest) {
+            pick = ((NSArray *)sorted.firstObject)[0];
+            why  = @"题干含「开始/预售/哪天」→ 选最早的未来日期";
+        } else {
+            pick = ((NSArray *)sorted[arc4random_uniform((uint32_t)sorted.count)])[0];
+            why  = @"题干无时间方向词 → 未来日期里随机";
+        }
+        NSMutableArray *desc = [NSMutableArray array];
+        for (NSArray *a in sorted) [desc addObject:a[0]];
+        aaLog(@"[日期规则] 今天 %d-%02d-%02d；%d/%lu 个选项是日期，未来有 %lu 个：%@；%@ → 选「%@」",
+              curY, curM, curD, dateCnt, (unsigned long)opts.count,
+              (unsigned long)future.count, desc, why, pick);
+        return pick;
+    } @catch (NSException *e) { aaLog(@"[异常] 日期规则：%@", e); }
+    return nil;
+}
+
 // ---- 联网问答案：返回正确选项的文字；失败/超时返回 nil ----
 static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg,
                   void (^cb)(NSString *)) {
     @try {
         NSString *api   = [cfg[@"api"] isKindOfClass:[NSString class]] ? cfg[@"api"] : @"";
         NSString *key   = [cfg[@"key"] isKindOfClass:[NSString class]] ? cfg[@"key"] : @"";
-        NSString *model = [cfg[@"model"] isKindOfClass:[NSString class]] ? cfg[@"model"] : @"deepseek-chat";
+        // 注意：deepseek-chat / deepseek-reasoner 已于 2026-07-24 退役，必须用 deepseek-flash
+        NSString *model = [cfg[@"model"] isKindOfClass:[NSString class]] ? cfg[@"model"] : @"deepseek-flash";
         if (api.length == 0 || key.length == 0) { if (cb) cb(nil); return; }
 
         NSString *optStr = [opts componentsJoinedByString:@"\n"];
@@ -562,8 +682,10 @@ static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg,
             @"如果无法确定，就返回你认为最可能的那一个选项文字。\n题目：%@\n选项：\n%@",
             question, optStr];
 
+        // thinking 默认是 enabled(effort=high)，会多花好几秒 —— 抢红包场景必须显式关掉
         NSDictionary *body = @{@"model": model,
                                @"messages": @[@{@"role": @"user", @"content": prompt}],
+                               @"thinking": @{@"type": @"disabled"},
                                @"max_tokens": @32,
                                @"temperature": @0};
         NSData *bd = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
@@ -833,7 +955,16 @@ static void tryWebViewQuiz(void) {
                     };
                     if (!opts || opts.count == 0) { justRandom(@"读不到选项"); return; }
 
-                    // 先查本地缓存：命中就 0 毫秒作答，完全不联网
+                    // ① 本地日期规则（0ms，不联网）：选项里挑未来日期。
+                    //    放在缓存之前 —— 日期题答案随"今天"变化，缓存反而会给出过期答案，所以也不写缓存。
+                    NSString *dateAns = aaDateRuleAnswer(q, opts);
+                    if (dateAns.length) {
+                        aaLog(@"[H5] 走本地日期规则（不联网、不写缓存）");
+                        answerAndSubmit(wv, dateAns, q);
+                        return;
+                    }
+
+                    // ② 本地缓存：命中就 0 毫秒作答，完全不联网
                     NSString *cached = cacheLookup(q);
                     if (cached.length) {
                         aaLog(@"[缓存] 命中（0ms，不联网）：%@ → %@", q, cached);
