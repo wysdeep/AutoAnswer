@@ -691,6 +691,34 @@ static NSString *aaDateRuleAnswer(NSString *question, NSArray *opts) {
     return nil;
 }
 
+// 把 AI 的一句话答案拆成多个选项文字（支持 | 与空格两种分隔；空格切分需每段都能对上选项才采用）
+static NSArray *aaSplitAnswers(NSString *ans, NSArray *opts) {
+    NSMutableArray *out = [NSMutableArray array];
+    if (ans.length == 0) return out;
+    NSString *s = [ans stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSArray *parts = [s componentsSeparatedByString:@"|"];
+    if (parts.count <= 1) {
+        NSArray *sp = [s componentsSeparatedByCharactersInSet:
+                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        sp = [sp filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
+        if (sp.count > 1) {
+            NSInteger ok = 0;
+            for (NSString *p in sp) {
+                for (NSString *o in opts) {
+                    if ([o isKindOfClass:[NSString class]] &&
+                        ([o hasPrefix:p] || [p hasPrefix:o] || [o containsString:p])) { ok++; break; }
+                }
+            }
+            if (ok == (NSInteger)sp.count) parts = sp;   // 全部对得上才认为是多答案
+        }
+    }
+    for (NSString *p in parts) {
+        NSString *t = [p stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (t.length) [out addObject:t];
+    }
+    return out;
+}
+
 // ---- 无 AI 时的启发式兜底：不联网、不要题库，比纯随机命中率高一点 ----
 // ① 「以上都对 / 以上都是」家族 → 直接选它
 // ② 一长三短：最长项明显长于其余 → 选最长
@@ -720,7 +748,7 @@ static NSString *aaHeuristicAnswer(NSArray *opts) {
 }
 
 // ---- 联网问答案：返回正确选项的文字；失败/超时返回 nil ----
-static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg,
+static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg, BOOL isMulti,
                   void (^cb)(NSString *)) {
     @try {
         NSString *api   = [cfg[@"api"] isKindOfClass:[NSString class]] ? cfg[@"api"] : @"";
@@ -731,9 +759,13 @@ static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg,
 
         NSString *optStr = [opts componentsJoinedByString:@"\n"];
         NSString *prompt = [NSString stringWithFormat:
-            @"这是直播答题，请只返回正确选项的完整文字，不要解释、不要标点、不要引号、不要选项字母。\n"
-            @"如果无法确定，就返回你认为最可能的那一个选项文字。\n题目：%@\n选项：\n%@",
-            question, optStr];
+            @"这是直播答题（%@）。\n"
+            @"单选题：只返回正确选项的完整文字，只返回一个。\n"
+            @"多选题：返回所有正确选项的完整文字，多个之间用|隔开，不要用空格、顿号或逗号。\n"
+            @"不要解释、不要句号、不要引号、不要选项字母。\n"
+            @"如果无法确定：单选返回最可能的一个，多选返回最可能的两个。\n"
+            @"题目：%@\n选项：\n%@",
+            isMulti ? @"多选题" : @"单选题", question, optStr];
 
         // DeepSeek / 智谱 的 thinking 默认是 enabled(effort=high)，会多花好几秒 —— 抢红包必须显式关掉。
         // 其它平台（硅基流动、魔搭等）不认识这个字段，别乱发，否则可能被拒。
@@ -837,15 +869,19 @@ static NSString *aaQuizJS(BOOL doClick, NSString *answer) {
         "for(var i=si-1;i>=start;i--){var t=cand[i].t;"
         " if(!t||t.length>30)continue;"
         " if(t.indexOf('\\n')>=0)continue;"
-        " if(t===qt)continue;"
         " if(/^\\d+\\s*s$/.test(t))continue;"
-        " if(/规则|剩余|答题时间|倒计时|关闭|取消|返回|首页|我知道|提交/.test(t))continue;"
+        " if(/规则|剩余|答题时间|倒计时|关闭|取消|返回|首页|我知道|提交|多选|单选/.test(t))continue;"
+        " if(qt&&(t===qt||t.indexOf(qt)>=0||(qt.indexOf(t)>=0&&t.length>=4)))continue;"
         " if(seen[t])continue;"
         " seen[t]=1;opts.push(cand[i]);}"
         "opts.reverse();"
-        "var names=opts.map(function(o){return o.t;});";
+        "var names=opts.map(function(o){return o.t;});"
+        "var multi=false;"
+        "all.forEach(function(e){if(multi)return;var t=txt(e);"
+        " if(t&&t.length<=6&&t.indexOf('多选')>=0)multi=true;});"
+        "if(!multi&&qt&&qt.indexOf('多选')>=0)multi=true;";
     if (!doClick) {
-        return [head stringByAppendingString:@"return JSON.stringify({q:qt,opts:names});})()"];
+        return [head stringByAppendingString:@"return JSON.stringify({q:qt,opts:names,multi:multi});})()"];
     }
     NSString *tail = [NSString stringWithFormat:
         @"function pt(el){var r=el.getBoundingClientRect();"
@@ -871,12 +907,19 @@ static NSString *aaQuizJS(BOOL doClick, NSString *answer) {
         " try{el.click();}catch(_){}"
         "}"
         "var want='%@';"
-        "var hit=null;"
-        "if(want){opts.forEach(function(o){if(!hit&&(o.t===want||o.t.indexOf(want)>=0||want.indexOf(o.t)>=0))hit=o;});}"
-        "if(!hit&&opts.length){hit=opts[Math.floor(Math.random()*opts.length)];}"
+        "var parts=want?want.split('|').filter(function(s){return s&&s.trim();}):[];"
+        "var hits=[];"
+        "parts.forEach(function(w){w=w.trim();if(!w)return;"
+        " opts.forEach(function(o){"
+        "  if(hits.indexOf(o)>=0)return;"
+        "  if(o.t===w||o.t.indexOf(w)===0||w.indexOf(o.t)===0)hits.push(o);});});"
+        "if(!hits.length&&opts.length)hits=[opts[Math.floor(Math.random()*opts.length)]];"
         "var clicked=[];"
-        "if(hit){try{fire(hit.e);clicked.push(hit.t+'#'+(hit.e.tagName||'?'));}catch(_){}}"
-        "return JSON.stringify({q:qt,opts:names,want:want,clicked:clicked});})()", safe];
+        "hits.forEach(function(h,i){"
+        " var go=function(){try{fire(h.e);clicked.push(h.t);}catch(_){}};"
+        " if(i===0)go();else setTimeout(go,i*180);});"
+        "return JSON.stringify({q:qt,opts:names,want:want,multi:multi,"
+        " n:hits.length,clicked:clicked});})()", safe];
     return [head stringByAppendingString:tail];
 }
 
@@ -935,9 +978,13 @@ static NSString *aaSubmitJS(int mode) {
 
 // ---- 先点选项，隔 0.35s 等页面状态刷新，再点提交；0.8s 后复查，没提交出去就改点外层容器重试 ----
 static void answerAndSubmit(WKWebView *wv, NSString *answer, NSString *qkey) {
+    // 多个答案时 JS 里是 setTimeout(i*180) 逐个点的，提交要等最后一个点完
+    NSUInteger nAns = 1;
+    if (answer.length) nAns = [[answer componentsSeparatedByString:@"|"] count];
+    double wait = 0.45 + 0.20 * (double)((nAns > 1) ? (nAns - 1) : 0);
     webViewRunJS(wv, aaQuizJS(YES, answer), ^(NSString *r){
         aaLog(@"[H5] 选项点击结果：%@", r ? r : @"无返回");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.40 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             webViewRunJS(wv, aaSubmitJS(0), ^(NSString *r2){
                 aaLog(@"[H5] 提交结果(mode0)：%@", r2 ? r2 : @"无返回");
@@ -1021,16 +1068,31 @@ static void tryWebViewQuiz(void) {
                 webViewRunJS(wv, aaQuizJS(NO, nil), ^(NSString *info){
                     NSString *q = qKey;
                     NSArray *opts = nil;
+                    BOOL isMulti = NO;
                     if (info) {
                         id j = [NSJSONSerialization JSONObjectWithData:
                                 [info dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
                         if ([j isKindOfClass:[NSDictionary class]]) {
                             if ([j[@"q"] isKindOfClass:[NSString class]] && [j[@"q"] length]) q = j[@"q"];
                             if ([j[@"opts"] isKindOfClass:[NSArray class]]) opts = j[@"opts"];
+                            isMulti = [j[@"multi"] boolValue];
                         }
                     }
+                    if (!isMulti && ([q containsString:@"多选"] ||
+                                     [q containsString:@"哪些"] || [q containsString:@"哪两个"] ||
+                                     [q containsString:@"哪三个"] || [q containsString:@"哪四个"]))
+                        isMulti = YES;
+                    if (isMulti) aaLog(@"[H5] 判定为多选题（DOM 徽标/题干关键词）");
+
                     // 兜底：读不到选项 / 没配 key → 直接随机点，绝不空过
                     void (^justRandom)(NSString *) = ^(NSString *why){
+                        if (isMulti) {
+                            // 多选题：拿不准就全选（多选至少要 2 个，只点 1 个必错）
+                            NSString *all = [opts componentsJoinedByString:@"|"];
+                            aaLog(@"[H5] %@ → 多选题兜底全选 %lu 项", why, (unsigned long)opts.count);
+                            answerAndSubmit(wv, all, q);
+                            return;
+                        }
                         NSString *h = aaHeuristicAnswer(opts);
                         if (h.length) {
                             aaLog(@"[H5] %@ → 走启发式（非纯随机）", why);
@@ -1044,11 +1106,14 @@ static void tryWebViewQuiz(void) {
 
                     // ① 本地日期规则（0ms，不联网）：选项里挑未来日期。
                     //    放在缓存之前 —— 日期题答案随"今天"变化，缓存反而会给出过期答案，所以也不写缓存。
-                    NSString *dateAns = aaDateRuleAnswer(q, opts);
-                    if (dateAns.length) {
-                        aaLog(@"[H5] 走本地日期规则（不联网、不写缓存）");
-                        answerAndSubmit(wv, dateAns, q);
-                        return;
+                    //    多选题跳过：日期规则只会给出一个答案。
+                    if (!isMulti) {
+                        NSString *dateAns = aaDateRuleAnswer(q, opts);
+                        if (dateAns.length) {
+                            aaLog(@"[H5] 走本地日期规则（不联网、不写缓存）");
+                            answerAndSubmit(wv, dateAns, q);
+                            return;
+                        }
                     }
 
                     // ② 本地缓存：命中就 0 毫秒作答，完全不联网
@@ -1075,13 +1140,20 @@ static void tryWebViewQuiz(void) {
                         if (done) return;
                         done = YES;
                         if (ans.length) {
-                            aaLog(@"[AI] 采用答案：%@", ans);
-                            cacheRemember(q, ans);      // 记住，下次 0ms
+                            // AI 可能一次给多个答案（空格或 | 分隔），拆开再用 | 拼给 JS
+                            NSArray *parts = aaSplitAnswers(ans, opts);
+                            NSString *joined = [parts componentsJoinedByString:@"|"];
+                            if (isMulti && parts.count < 2)
+                                aaLog(@"[AI] 多选题但只返回 %lu 个答案（可能不准）", (unsigned long)parts.count);
+                            aaLog(@"[AI] 采用答案：%@", joined);
+                            cacheRemember(q, joined);   // 记住，下次 0ms（多选答案也一并缓存）
                             aaLog(@"[缓存] 已记住本题，下次遇到直接秒答");
+                            answerAndSubmit(wv, joined, q);
+                        } else {
+                            answerAndSubmit(wv, nil, q);
                         }
-                        answerAndSubmit(wv, ans, q);
                     };
-                    askAI(q, opts, cfg, ^(NSString *ans){ finish(ans); });
+                    askAI(q, opts, cfg, isMulti, ^(NSString *ans){ finish(ans); });
                     // 超时兜底：AI 没按时回就立刻随机点，保证不空过
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(tmo * NSEC_PER_SEC)),
                                    dispatch_get_main_queue(), ^{
