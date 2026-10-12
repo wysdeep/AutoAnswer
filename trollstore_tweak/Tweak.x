@@ -764,6 +764,7 @@ static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg,
             NSString *ans = nil;
             NSInteger code = 0;
             NSString *raw = @"";
+            BOOL usedReason = NO;
             @try {
                 if ([r isKindOfClass:[NSHTTPURLResponse class]]) code = ((NSHTTPURLResponse *)r).statusCode;
                 if (d) {
@@ -773,8 +774,16 @@ static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg,
                         id ch = j[@"choices"];
                         if ([ch isKindOfClass:[NSArray class]] && [ch count] > 0) {
                             id msg = ch[0][@"message"];
-                            if ([msg isKindOfClass:[NSDictionary class]] && [msg[@"content"] isKindOfClass:[NSString class]])
-                                ans = msg[@"content"];
+                            if ([msg isKindOfClass:[NSDictionary class]]) {
+                                if ([msg[@"content"] isKindOfClass:[NSString class]] && [msg[@"content"] length])
+                                    ans = msg[@"content"];
+                                // 思考模式下 content 是空的，答案在 reasoning_content 里
+                                else if ([msg[@"reasoning_content"] isKindOfClass:[NSString class]] &&
+                                         [msg[@"reasoning_content"] length]) {
+                                    ans = msg[@"reasoning_content"];
+                                    usedReason = YES;
+                                }
+                            }
                         }
                     }
                 }
@@ -784,6 +793,7 @@ static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg,
             NSString *errDesc = e ? [e localizedDescription] : @"";
             NSString *rawShort = raw.length > 200 ? [raw substringToIndex:200] : raw;
             dispatch_async(dispatch_get_main_queue(), ^{
+                if (usedReason) aaLog(@"[AI] content 为空（思考模式没关掉？）→ 已改读 reasoning_content");
                 if (ans.length) {
                     aaLog(@"[AI] 耗时 %.2fs，返回：%@", cost, ans.length > 60 ? [ans substringToIndex:60] : ans);
                 } else {
