@@ -487,19 +487,28 @@ static NSDictionary *loadAIConfig(void) {
     id o = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
     if (![o isKindOfClass:[NSDictionary class]]) return nil;
     NSMutableDictionary *m = [o mutableCopy];
-    // 退役/不推荐的模型名自动纠偏（deepseek-chat、deepseek-reasoner 已于 2026-07-24 退役）
+    // 退役/不推荐的模型名自动纠偏。按 api 域名挑默认模型（三家都有免费额度）：
+    //   deepseek      → deepseek-flash        （deepseek-chat/reasoner 已于 2026-07-24 退役）
+    //   bigmodel      → glm-4.5-flash         （智谱，免费）
+    //   siliconflow   → Qwen/Qwen2.5-7B-Instruct（硅基流动，永久免费模型）
+    //   modelscope    → Qwen/Qwen2.5-7B-Instruct（阿里魔搭，免费）
     NSString *mdl = [m[@"model"] isKindOfClass:[NSString class]] ? m[@"model"] : @"";
+    NSString *api = [m[@"api"]   isKindOfClass:[NSString class]] ? m[@"api"]   : @"";
     if (mdl.length == 0 ||
         [mdl isEqualToString:@"deepseek-chat"] || [mdl isEqualToString:@"deepseek-reasoner"] ||
         [mdl isEqualToString:@"deepseek-v4-flash"]) {
+        NSString *nm = @"deepseek-flash";
+        if      ([api containsString:@"bigmodel"])    nm = @"glm-4.5-flash";
+        else if ([api containsString:@"siliconflow"])  nm = @"Qwen/Qwen2.5-7B-Instruct";
+        else if ([api containsString:@"modelscope"])   nm = @"Qwen/Qwen2.5-7B-Instruct";
         NSString *old = mdl.length ? mdl : @"(空)";
-        m[@"model"] = @"deepseek-flash";
+        m[@"model"] = nm;
         @try {
             NSData *nd = [NSJSONSerialization dataWithJSONObject:m
                                                          options:NSJSONWritingPrettyPrinted error:nil];
             if (nd) [nd writeToFile:aaConfigPath() atomically:YES];
         } @catch (NSException *e) {}
-        aaLog(@"[配置] 模型名 %@ 已过时/不可用 → 已自动改为 deepseek-flash 并写回配置文件", old);
+        aaLog(@"[配置] 模型名 %@ 已过时/为空 → 已自动改为 %@ 并写回配置文件", old, nm);
     }
     return m;
 }
@@ -682,6 +691,34 @@ static NSString *aaDateRuleAnswer(NSString *question, NSArray *opts) {
     return nil;
 }
 
+// ---- 无 AI 时的启发式兜底：不联网、不要题库，比纯随机命中率高一点 ----
+// ① 「以上都对 / 以上都是」家族 → 直接选它
+// ② 一长三短：最长项明显长于其余 → 选最长
+static NSString *aaHeuristicAnswer(NSArray *opts) {
+    @try {
+        if (!opts || opts.count < 2) return nil;
+        for (id o in opts) {
+            if (![o isKindOfClass:[NSString class]]) continue;
+            NSString *t = (NSString *)o;
+            for (NSString *mk in allAboveMarkers())
+                if ([t containsString:mk]) { aaLog(@"[启发] 命中「以上都对」家族 → %@", t); return t; }
+        }
+        NSArray *sorted = [opts sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b){
+            if (a.length > b.length) return NSOrderedAscending;
+            if (a.length < b.length) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+        NSString *longest = (NSString *)sorted.firstObject;
+        NSString *second  = sorted.count > 1 ? (NSString *)sorted[1] : @"";
+        if (longest.length >= 6 && longest.length >= second.length * 2) {
+            aaLog(@"[启发] 一长三短（最长 %lu 字 vs 次长 %lu 字）→ %@",
+                  (unsigned long)longest.length, (unsigned long)second.length, longest);
+            return longest;
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
 // ---- 联网问答案：返回正确选项的文字；失败/超时返回 nil ----
 static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg,
                   void (^cb)(NSString *)) {
@@ -698,13 +735,16 @@ static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg,
             @"如果无法确定，就返回你认为最可能的那一个选项文字。\n题目：%@\n选项：\n%@",
             question, optStr];
 
-        // thinking 默认是 enabled(effort=high)，会多花好几秒 —— 抢红包场景必须显式关掉
-        NSDictionary *body = @{@"model": model,
-                               @"messages": @[@{@"role": @"user", @"content": prompt}],
-                               @"thinking": @{@"type": @"disabled"},
-                               @"max_tokens": @32,
-                               @"temperature": @0};
+        // DeepSeek / 智谱 的 thinking 默认是 enabled(effort=high)，会多花好几秒 —— 抢红包必须显式关掉。
+        // 其它平台（硅基流动、魔搭等）不认识这个字段，别乱发，否则可能被拒。
+        NSMutableDictionary *body = [@{@"model": model,
+                                       @"messages": @[@{@"role": @"user", @"content": prompt}],
+                                       @"max_tokens": @32,
+                                       @"temperature": @0} mutableCopy];
+        if ([api containsString:@"deepseek"] || [api containsString:@"bigmodel"])
+            body[@"thinking"] = @{@"type": @"disabled"};
         NSData *bd = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+        aaLog(@"[AI] 请求 %@（model=%@）", api, model);
         if (!bd) { if (cb) cb(nil); return; }
 
         NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:api]];
@@ -722,8 +762,12 @@ static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg,
         NSDate *t0 = [NSDate date];
         [[s dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e){
             NSString *ans = nil;
+            NSInteger code = 0;
+            NSString *raw = @"";
             @try {
-                if (!e && d) {
+                if ([r isKindOfClass:[NSHTTPURLResponse class]]) code = ((NSHTTPURLResponse *)r).statusCode;
+                if (d) {
+                    raw = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
                     id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
                     if ([j isKindOfClass:[NSDictionary class]]) {
                         id ch = j[@"choices"];
@@ -737,8 +781,19 @@ static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg,
             } @catch (NSException *ex) { ans = nil; }
             if (ans) ans = [ans stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
             double cost = [[NSDate date] timeIntervalSinceDate:t0];
+            NSString *errDesc = e ? [e localizedDescription] : @"";
+            NSString *rawShort = raw.length > 200 ? [raw substringToIndex:200] : raw;
             dispatch_async(dispatch_get_main_queue(), ^{
-                aaLog(@"[AI] 耗时 %.2fs，原始返回：%@", cost, ans ? (ans.length > 60 ? [ans substringToIndex:60] : ans) : @"(空)");
+                if (ans.length) {
+                    aaLog(@"[AI] 耗时 %.2fs，返回：%@", cost, ans.length > 60 ? [ans substringToIndex:60] : ans);
+                } else {
+                    aaLog(@"[AI] 失败 耗时 %.2fs｜HTTP=%ld｜err=%@｜body=%@",
+                          cost, (long)code, errDesc, rawShort);
+                    if (code == 401 || code == 403)      aaLog(@"[AI] → key 填错或没权限，检查 AutoAnswer_config.json 的 key");
+                    else if (code == 402)                aaLog(@"[AI] → 余额不足，需要充值或换免费平台");
+                    else if (code == 429)                aaLog(@"[AI] → 被限流/免费额度用完，换平台或把 timeout 调大");
+                    else if (code >= 400 && code < 500)  aaLog(@"[AI] → 请求被拒，多半是 model 名字不对或该平台没有这个模型");
+                }
                 if (cb) cb(ans);
             });
         }] resume];
@@ -966,8 +1021,14 @@ static void tryWebViewQuiz(void) {
                     }
                     // 兜底：读不到选项 / 没配 key → 直接随机点，绝不空过
                     void (^justRandom)(NSString *) = ^(NSString *why){
-                        aaLog(@"[H5] %@ → 随机作答", why);
-                        answerAndSubmit(wv, nil, q);
+                        NSString *h = aaHeuristicAnswer(opts);
+                        if (h.length) {
+                            aaLog(@"[H5] %@ → 走启发式（非纯随机）", why);
+                            answerAndSubmit(wv, h, q);
+                        } else {
+                            aaLog(@"[H5] %@ → 随机作答", why);
+                            answerAndSubmit(wv, nil, q);
+                        }
                     };
                     if (!opts || opts.count == 0) { justRandom(@"读不到选项"); return; }
 
