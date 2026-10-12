@@ -461,7 +461,28 @@ static void tick(void) {
         createOverlay(sc);
     }
 
-    if (!gEnabled || gWorking) return;
+    // 开关没开也做轻量探测（3s 节流）：屏上出现答题场景就记一条提醒，便于排查"忘了开开关"
+    if (!gEnabled) {
+        static NSDate *gLastOffDiag = nil;
+        NSDate *nowOff = [NSDate date];
+        if (!gLastOffDiag || [nowOff timeIntervalSinceDate:gLastOffDiag] > 3.0) {
+            gLastOffDiag = nowOff;
+            @try {
+                NSMutableString *all0 = [NSMutableString string];
+                NSMutableArray *t0 = [NSMutableArray array];
+                NSMutableArray *f0 = [NSMutableArray array];
+                scanScreen(all0, t0, f0);
+                for (NSString *k in @[@"答题抢红包", @"确认提交", @"答题超时"]) {
+                    if ([all0 containsString:k]) {
+                        aaLog(@"[提醒] 屏上有答题场景（含「%@」），但悬浮球是「关」→ 点一下悬浮球变绿才会自动作答", k);
+                        break;
+                    }
+                }
+            } @catch (NSException *e) {}
+        }
+        return;
+    }
+    if (gWorking) return;
     @try {
 
     reloadBankIfNeeded();
