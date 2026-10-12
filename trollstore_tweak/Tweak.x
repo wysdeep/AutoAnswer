@@ -493,11 +493,58 @@ static void ensureConfigFile(void) {
     NSDictionary *def = @{@"api":    @"https://api.deepseek.com/chat/completions",
                           @"key":    @"",
                           @"model":  @"deepseek-chat",
-                          @"timeout": @3.0};
+                          @"timeout": @1.5};
     NSData *d = [NSJSONSerialization dataWithJSONObject:def
                                                 options:NSJSONWritingPrettyPrinted error:nil];
     if (d && [d writeToFile:p atomically:YES])
         aaLog(@"已生成 AI 配置文件（用 Filza 填入 key 后重启淘宝生效）：%@", p);
+}
+
+// ---- 自学习缓存：AI 答过的题记下来，下次同样的题 0 毫秒命中，不再联网 ----
+static NSString *aaCachePath(void) {
+    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return [docs.firstObject stringByAppendingPathComponent:@"AutoAnswer_cache.json"];
+}
+static NSMutableDictionary *loadCache(void) {
+    NSData *d = [NSData dataWithContentsOfFile:aaCachePath()];
+    if (!d) return [NSMutableDictionary dictionary];
+    id o = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+    return [o isKindOfClass:[NSDictionary class]] ? [o mutableCopy] : [NSMutableDictionary dictionary];
+}
+static void saveCache(NSMutableDictionary *c) {
+    @try {
+        if (c.count > 1000) return;
+        NSData *d = [NSJSONSerialization dataWithJSONObject:c options:0 error:nil];
+        if (d) [d writeToFile:aaCachePath() atomically:YES];
+    } @catch (NSException *e) {}
+}
+static NSString *cacheLookup(NSString *q) {
+    @try {
+        NSString *nq = [q stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (nq.length == 0) return nil;
+        NSDictionary *c = loadCache();
+        id v = c[nq];
+        if ([v isKindOfClass:[NSString class]] && [v length]) return v;
+        if (nq.length >= 6) {                     // 模糊：互相包含（太短不比，防误命中）
+            for (NSString *k in c) {
+                if (![k isKindOfClass:[NSString class]] || k.length < 6) continue;
+                if ([nq containsString:k] || [k containsString:nq]) {
+                    id vv = c[k];
+                    if ([vv isKindOfClass:[NSString class]] && [vv length]) return vv;
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+static void cacheRemember(NSString *q, NSString *a) {
+    @try {
+        NSString *nq = [q stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (nq.length == 0 || a.length == 0) return;
+        NSMutableDictionary *c = loadCache();
+        c[nq] = a;
+        saveCache(c);
+    } @catch (NSException *e) {}
 }
 
 // ---- 联网问答案：返回正确选项的文字；失败/超时返回 nil ----
@@ -529,8 +576,8 @@ static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg,
         req.HTTPBody = bd;
 
         double tmo = [cfg[@"timeout"] respondsToSelector:@selector(doubleValue)]
-                   ? [cfg[@"timeout"] doubleValue] : 3.0;
-        if (tmo <= 0) tmo = 3.0;
+                   ? [cfg[@"timeout"] doubleValue] : 1.5;
+        if (tmo <= 0) tmo = 1.5;
         req.timeoutInterval = tmo + 1.0;
 
         NSURLSession *s = [NSURLSession sharedSession];
@@ -673,6 +720,16 @@ static void tryWebViewQuiz(void) {
                     };
                     if (!opts || opts.count == 0) { justRandom(@"读不到选项"); return; }
 
+                    // 先查本地缓存：命中就 0 毫秒作答，完全不联网
+                    NSString *cached = cacheLookup(q);
+                    if (cached.length) {
+                        aaLog(@"[缓存] 命中（0ms，不联网）：%@ → %@", q, cached);
+                        webViewRunJS(wv, aaQuizJS(YES, cached), ^(NSString *r){
+                            aaLog(@"[H5] 作答结果(缓存)：%@", r ? r : @"无返回");
+                        });
+                        return;
+                    }
+
                     NSDictionary *cfg = loadAIConfig();
                     NSString *key = [cfg[@"key"] isKindOfClass:[NSString class]] ? cfg[@"key"] : @"";
                     if (!cfg || key.length == 0) {
@@ -682,13 +739,17 @@ static void tryWebViewQuiz(void) {
                     aaLog(@"[H5] 选项：%@ → 开始问 AI", opts);
 
                     double tmo = [cfg[@"timeout"] respondsToSelector:@selector(doubleValue)]
-                               ? [cfg[@"timeout"] doubleValue] : 3.0;
-                    if (tmo <= 0) tmo = 3.0;
+                               ? [cfg[@"timeout"] doubleValue] : 1.5;
+                    if (tmo <= 0) tmo = 1.5;
                     __block BOOL done = NO;
                     void (^finish)(NSString *) = ^(NSString *ans){
                         if (done) return;
                         done = YES;
-                        if (ans.length) aaLog(@"[AI] 采用答案：%@", ans);
+                        if (ans.length) {
+                            aaLog(@"[AI] 采用答案：%@", ans);
+                            cacheRemember(q, ans);      // 记住，下次 0ms
+                            aaLog(@"[缓存] 已记住本题，下次遇到直接秒答");
+                        }
                         webViewRunJS(wv, aaQuizJS(YES, ans), ^(NSString *r){
                             aaLog(@"[H5] 作答结果：%@", r ? r : @"无返回");
                         });
