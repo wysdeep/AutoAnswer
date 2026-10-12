@@ -701,9 +701,13 @@ static void tick(void) {
                   confirmText.length ? confirmText : (confirm ? @"有" : @"无"),
                   (unsigned long)options.count, qText.length ? qText : @"-");
             {
-                // 中部文字地图：到底中间能不能读到选项，看这一行就够（8s 节流）
+                // 中部文字地图：到底中间能不能读到选项，看这一行就够。
+                // 平时 8s 打一次省日志；一旦疑似出现答题界面，立刻 1s 打一次，
+                // 否则题目只出现几秒会被 8s 节流整场跳过，白测一轮。
                 static NSDate *gLastMap = nil;
-                if (!gLastMap || [now timeIntervalSinceDate:gLastMap] > 8.0) {
+                BOOL hot = hasQuiz || confirm || options.count >= 2;
+                double gap = hot ? 1.0 : 8.0;
+                if (!gLastMap || [now timeIntervalSinceDate:gLastMap] > gap) {
                     gLastMap = now;
                     NSMutableArray *m = [NSMutableArray array];
                     for (NSArray *p in textFrames) {
@@ -713,7 +717,7 @@ static void tick(void) {
                         [m addObject:[NSString stringWithFormat:@"「%@」@(%.0f,%.0f)",
                                       p[0], CGRectGetMidX(f), CGRectGetMidY(f)]];
                     }
-                    aaLog(@"[地图] 屏中部文字：%@", m);
+                    aaLog(@"[地图] 屏中部文字%@：%@", hot ? @"(疑似答题中)" : @"", m);
                 }
             }
             if (confirm && options.count < 2) {
