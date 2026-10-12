@@ -451,8 +451,98 @@ static void retrySubmitIfBusy(UIView *confirm, NSInteger left) {
     }
 }
 
+// ---------------- WebView(H5) 作答路线：与原生并行，谁抓到走谁 ----------------
+// 证据矛盾：日志显示屏上有 WKWebView、原生树读不到选项文字；但截图里按钮又像原生。
+// 不再二选一，两条路都跑，并把抓到的内容全量写日志，用实测定论。
+static void collectWebViews(UIView *v, NSMutableArray *out) {
+    if (!v) return;
+    Class wk = NSClassFromString(@"WKWebView");
+    if (wk && [v isKindOfClass:wk]) {
+        WKWebView *wv = (WKWebView *)v;
+        if (!wv.isLoading && !wv.hidden && wv.alpha > 0.01 && wv.window) [out addObject:wv];
+    }
+    for (UIView *c in v.subviews) collectWebViews(c, out);
+}
+
+static void webViewRunJS(WKWebView *wv, NSString *js, void (^cb)(NSString *)) {
+    @try {
+        if (!wv || wv.isLoading || !wv.window) { if (cb) cb(nil); return; }
+        [wv evaluateJavaScript:js completionHandler:^(id res, NSError *err){
+            if (err) { if (cb) cb(nil); return; }
+            if (cb) cb(res ? [NSString stringWithFormat:@"%@", res] : @"");
+        }];
+    } @catch (NSException *e) {
+        if (cb) cb(nil);
+    }
+}
+
+static NSString *aaQuizJS(void) {
+    static NSString *js = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        js = @"(function(){"
+        "function txt(e){return (e.innerText||e.textContent||'').trim();}"
+        "var all=[].slice.call(document.querySelectorAll('*'));"
+        "var clickable=all.filter(function(e){var t=txt(e);"
+        "return t.length>=1&&t.length<=40&&(e.tagName==='BUTTON'||e.tagName==='A'||e.getAttribute('role')==='button'||e.onclick);});"
+        "var non=/确认提交|提交答案|交卷|提交|我知道了|知道了|确定|关闭|取消|下一题|跳过|换一换|返回|首页/;"
+        "var seen={},uniq=[];"
+        "clickable.forEach(function(e){var t=txt(e);if(!non.test(t)&&!seen[t]){seen[t]=1;uniq.push(e);}});"
+        "var body=(document.body&&document.body.innerText)?document.body.innerText:'';"
+        "var q=body.slice(0,200);"
+        "var n=1,m=q.match(/哪\\s*([0-9]|一|二|两|三|四|五|六|七|八|九|十)\\s*[个种项]?/);"
+        "if(m){var c=m[1],map={'一':1,'二':2,'两':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10};"
+        "n=(/[0-9]/.test(c))?parseInt(c,10):(map[c]||1);}"
+        "var pool=uniq.slice(0,8),clicked=[];"
+        "if(n>=pool.length){pool.forEach(function(e){try{e.click();clicked.push(txt(e));}catch(_){}});}"
+        "else{var used={};while(clicked.length<n&&Object.keys(used).length<pool.length){var i=Math.floor(Math.random()*pool.length);if(used[i])continue;used[i]=1;try{pool[i].click();clicked.push(txt(pool[i]));}catch(_){}}}"
+        "var sub='no-submit';"
+        "for(var i=0;i<clickable.length;i++){var t=txt(clickable[i]);if(/确认提交|提交答案|交卷|^提交$/.test(t)&&t.length<=12){try{clickable[i].click();sub='clicked:'+t;}catch(_){sub='err';}break;}}"
+        "return JSON.stringify({q:q.slice(0,120),opts:pool.map(txt),clicked:clicked,submit:sub});"
+        "})()";
+    });
+    return js;
+}
+
+static void tryWebViewQuiz(void) {
+    @try {
+        static NSDate *gLastWeb = nil;
+        NSDate *now = [NSDate date];
+        if (gLastWeb && [now timeIntervalSinceDate:gLastWeb] < 0.8) return;   // 节流
+        gLastWeb = now;
+
+        NSMutableArray *wvs = [NSMutableArray array];
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]] &&
+                    ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
+                    for (UIWindow *w in ((UIWindowScene *)s).windows)
+                        if (!w.isHidden && w.alpha > 0.01) collectWebViews(w, wvs);
+                }
+            }
+        }
+        if (wvs.count == 0) return;
+
+        for (WKWebView *wv in wvs) {
+            webViewRunJS(wv, @"document.body.innerText", ^(NSString *txt){
+                if (!txt || txt.length == 0) return;
+                BOOL isQuiz = [txt containsString:@"确认提交"] || [txt containsString:@"提交答案"] ||
+                              ([txt containsString:@"答题"] &&
+                               ([txt containsString:@"剩余"] || [txt containsString:@"提交"]));
+                if (!isQuiz) return;
+                aaLog(@"[H5] 检测到答题页，DOM(前 300 字)：%@",
+                      txt.length > 300 ? [txt substringToIndex:300] : txt);
+                webViewRunJS(wv, aaQuizJS(), ^(NSString *r){
+                    aaLog(@"[H5] 作答结果：%@", r ? r : @"无返回");
+                });
+            });
+        }
+    } @catch (NSException *e) {
+        aaLog(@"[异常] tryWebViewQuiz：%@", e);
+    }
+}
+
 // ---------------- 主循环 ----------------
-// 选项为原生 UITextView：直接遍历控件树读文字 → 题库 kw 匹配题干 → 取 a → 在选项候选里找文字匹配的 TextView → 点击。
 static void tick(void) {
     if (!gOverlay) {
         UIWindowScene *sc = nil;
@@ -626,7 +716,12 @@ static void tick(void) {
         }
     }
 
-    if (!hasQuiz || !confirm || options.count < 2) return;
+    // 原生没抓到完整答题界面 → 很可能是 H5/WebView 渲染，改走 JS 路线（两条路并行，不互相排斥）
+    BOOL nativeOK = (hasQuiz && confirm && options.count >= 2);
+    if (!nativeOK && !gWorking) {
+        tryWebViewQuiz();
+    }
+    if (!nativeOK) return;
     if (all.length < 2) return;
 
     NSString *qkey = qText;
