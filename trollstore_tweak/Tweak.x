@@ -476,11 +476,104 @@ static void webViewRunJS(WKWebView *wv, NSString *js, void (^cb)(NSString *)) {
     }
 }
 
-static NSString *aaQuizJS(void) {
-    static NSString *js = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        js = @"(function(){"
+// ---- AI 配置：Documents/AutoAnswer_config.json，key 不写进代码 ----
+static NSString *aaConfigPath(void) {
+    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return [docs.firstObject stringByAppendingPathComponent:@"AutoAnswer_config.json"];
+}
+static NSDictionary *loadAIConfig(void) {
+    NSData *d = [NSData dataWithContentsOfFile:aaConfigPath()];
+    if (!d) return nil;
+    id o = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+    return [o isKindOfClass:[NSDictionary class]] ? o : nil;
+}
+static void ensureConfigFile(void) {
+    NSString *p = aaConfigPath();
+    if ([[NSFileManager defaultManager] fileExistsAtPath:p]) return;
+    NSDictionary *def = @{@"api":    @"https://api.deepseek.com/chat/completions",
+                          @"key":    @"",
+                          @"model":  @"deepseek-chat",
+                          @"timeout": @3.0};
+    NSData *d = [NSJSONSerialization dataWithJSONObject:def
+                                                options:NSJSONWritingPrettyPrinted error:nil];
+    if (d && [d writeToFile:p atomically:YES])
+        aaLog(@"已生成 AI 配置文件（用 Filza 填入 key 后重启淘宝生效）：%@", p);
+}
+
+// ---- 联网问答案：返回正确选项的文字；失败/超时返回 nil ----
+static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg,
+                  void (^cb)(NSString *)) {
+    @try {
+        NSString *api   = [cfg[@"api"] isKindOfClass:[NSString class]] ? cfg[@"api"] : @"";
+        NSString *key   = [cfg[@"key"] isKindOfClass:[NSString class]] ? cfg[@"key"] : @"";
+        NSString *model = [cfg[@"model"] isKindOfClass:[NSString class]] ? cfg[@"model"] : @"deepseek-chat";
+        if (api.length == 0 || key.length == 0) { if (cb) cb(nil); return; }
+
+        NSString *optStr = [opts componentsJoinedByString:@"\n"];
+        NSString *prompt = [NSString stringWithFormat:
+            @"这是直播答题，请只返回正确选项的完整文字，不要解释、不要标点、不要引号、不要选项字母。\n"
+            @"如果无法确定，就返回你认为最可能的那一个选项文字。\n题目：%@\n选项：\n%@",
+            question, optStr];
+
+        NSDictionary *body = @{@"model": model,
+                               @"messages": @[@{@"role": @"user", @"content": prompt}],
+                               @"max_tokens": @32,
+                               @"temperature": @0};
+        NSData *bd = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+        if (!bd) { if (cb) cb(nil); return; }
+
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:api]];
+        req.HTTPMethod = @"POST";
+        [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        [req setValue:[NSString stringWithFormat:@"Bearer %@", key] forHTTPHeaderField:@"Authorization"];
+        req.HTTPBody = bd;
+
+        double tmo = [cfg[@"timeout"] respondsToSelector:@selector(doubleValue)]
+                   ? [cfg[@"timeout"] doubleValue] : 3.0;
+        if (tmo <= 0) tmo = 3.0;
+        req.timeoutInterval = tmo + 1.0;
+
+        NSURLSession *s = [NSURLSession sharedSession];
+        NSDate *t0 = [NSDate date];
+        [[s dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e){
+            NSString *ans = nil;
+            @try {
+                if (!e && d) {
+                    id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+                    if ([j isKindOfClass:[NSDictionary class]]) {
+                        id ch = j[@"choices"];
+                        if ([ch isKindOfClass:[NSArray class]] && [ch count] > 0) {
+                            id msg = ch[0][@"message"];
+                            if ([msg isKindOfClass:[NSDictionary class]] && [msg[@"content"] isKindOfClass:[NSString class]])
+                                ans = msg[@"content"];
+                        }
+                    }
+                }
+            } @catch (NSException *ex) { ans = nil; }
+            if (ans) ans = [ans stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            double cost = [[NSDate date] timeIntervalSinceDate:t0];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                aaLog(@"[AI] 耗时 %.2fs，原始返回：%@", cost, ans ? (ans.length > 60 ? [ans substringToIndex:60] : ans) : @"(空)");
+                if (cb) cb(ans);
+            });
+        }] resume];
+    } @catch (NSException *e) {
+        aaLog(@"[异常] askAI：%@", e);
+        if (cb) cb(nil);
+    }
+}
+
+// ---- 组装 JS：doClick=NO 只读题面与选项；doClick=YES 点指定答案(answer 为空则随机)再提交 ----
+static NSString *aaQuizJS(BOOL doClick, NSString *answer) {
+    NSString *safe = @"";
+    if (answer) {
+        safe = [answer stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
+        safe = [safe stringByReplacingOccurrencesOfString:@"'"  withString:@"\\'"];
+        safe = [safe stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+        safe = [safe stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    }
+    NSString *head =
+        @"(function(){"
         "function txt(e){return (e.innerText||e.textContent||'').trim();}"
         "var all=[].slice.call(document.querySelectorAll('*'));"
         "var cand=[];"
@@ -497,18 +590,21 @@ static NSString *aaQuizJS(void) {
         " if(/^\\d+\\s*s$/.test(t))continue;"
         " if(/规则|剩余|答题时间|倒计时|关闭|取消|返回|首页|我知道|提交/.test(t))continue;"
         " opts.push(cand[i]);}"
-        "var n=1,m=qt.match(/哪\\s*([0-9]|一|二|两|三|四|五|六|七|八|九|十)\\s*[个种项]?/);"
-        "if(m){var c=m[1],map={'一':1,'二':2,'两':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10};"
-        "n=(/[0-9]/.test(c))?parseInt(c,10):(map[c]||1);}"
-        "var clicked=[],used={};"
-        "if(n>=opts.length){opts.forEach(function(o){try{o.e.click();clicked.push(o.t);}catch(_){}});}"
-        "else{while(clicked.length<n&&Object.keys(used).length<opts.length){var i=Math.floor(Math.random()*opts.length);if(used[i])continue;used[i]=1;try{opts[i].e.click();clicked.push(opts[i].t);}catch(_){}}}"
+        "var names=opts.map(function(o){return o.t;});";
+    if (!doClick) {
+        return [head stringByAppendingString:@"return JSON.stringify({q:qt,opts:names});})()"];
+    }
+    NSString *tail = [NSString stringWithFormat:
+        @"var want='%@';"
+        "var hit=null;"
+        "if(want){opts.forEach(function(o){if(!hit&&(o.t===want||o.t.indexOf(want)>=0||want.indexOf(o.t)>=0))hit=o;});}"
+        "if(!hit&&opts.length){hit=opts[Math.floor(Math.random()*opts.length)];}"
+        "var clicked=[];"
+        "if(hit){try{hit.e.click();clicked.push(hit.t);}catch(_){}}"
         "var sub='no-submit';"
         "try{cand[si].e.click();sub='clicked:'+cand[si].t;}catch(_){sub='err';}"
-        "return JSON.stringify({q:qt.slice(0,80),opts:opts.map(function(o){return o.t;}),clicked:clicked,submit:sub});"
-        "})()";
-    });
-    return js;
+        "return JSON.stringify({q:qt,opts:names,want:want,clicked:clicked,submit:sub});})()", safe];
+    return [head stringByAppendingString:tail];
 }
 
 static NSString *gLastWebQ = nil;   // 最近已答过的 H5 题干，用于判重
@@ -555,8 +651,56 @@ static void tryWebViewQuiz(void) {
                 aaLog(@"[H5] 检测到新题：%@", qKey);
                 aaLog(@"[H5] DOM(前 300 字)：%@",
                       txt.length > 300 ? [txt substringToIndex:300] : txt);
-                webViewRunJS(wv, aaQuizJS(), ^(NSString *r){
-                    aaLog(@"[H5] 作答结果：%@", r ? r : @"无返回");
+
+                // 第一步：只读题面与选项，先不点
+                webViewRunJS(wv, aaQuizJS(NO, nil), ^(NSString *info){
+                    NSString *q = qKey;
+                    NSArray *opts = nil;
+                    if (info) {
+                        id j = [NSJSONSerialization JSONObjectWithData:
+                                [info dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+                        if ([j isKindOfClass:[NSDictionary class]]) {
+                            if ([j[@"q"] isKindOfClass:[NSString class]] && [j[@"q"] length]) q = j[@"q"];
+                            if ([j[@"opts"] isKindOfClass:[NSArray class]]) opts = j[@"opts"];
+                        }
+                    }
+                    // 兜底：读不到选项 / 没配 key → 直接随机点，绝不空过
+                    void (^justRandom)(NSString *) = ^(NSString *why){
+                        aaLog(@"[H5] %@ → 随机作答", why);
+                        webViewRunJS(wv, aaQuizJS(YES, nil), ^(NSString *r){
+                            aaLog(@"[H5] 作答结果：%@", r ? r : @"无返回");
+                        });
+                    };
+                    if (!opts || opts.count == 0) { justRandom(@"读不到选项"); return; }
+
+                    NSDictionary *cfg = loadAIConfig();
+                    NSString *key = [cfg[@"key"] isKindOfClass:[NSString class]] ? cfg[@"key"] : @"";
+                    if (!cfg || key.length == 0) {
+                        justRandom([NSString stringWithFormat:@"未配置 AI key（配置文件 %@）", aaConfigPath()]);
+                        return;
+                    }
+                    aaLog(@"[H5] 选项：%@ → 开始问 AI", opts);
+
+                    double tmo = [cfg[@"timeout"] respondsToSelector:@selector(doubleValue)]
+                               ? [cfg[@"timeout"] doubleValue] : 3.0;
+                    if (tmo <= 0) tmo = 3.0;
+                    __block BOOL done = NO;
+                    void (^finish)(NSString *) = ^(NSString *ans){
+                        if (done) return;
+                        done = YES;
+                        if (ans.length) aaLog(@"[AI] 采用答案：%@", ans);
+                        webViewRunJS(wv, aaQuizJS(YES, ans), ^(NSString *r){
+                            aaLog(@"[H5] 作答结果：%@", r ? r : @"无返回");
+                        });
+                    };
+                    askAI(q, opts, cfg, ^(NSString *ans){ finish(ans); });
+                    // 超时兜底：AI 没按时回就立刻随机点，保证不空过
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(tmo * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        if (done) return;
+                        aaLog(@"[AI] %.1fs 超时 → 随机兜底", tmo);
+                        finish(nil);
+                    });
                 });
             });
         }
@@ -987,6 +1131,7 @@ static void tick(void) {
     @try { [[NSFileManager defaultManager] removeItemAtPath:aaLogPath() error:nil]; } @catch (...) {}
     loadBank();
     reloadBankIfNeeded();
+    ensureConfigFile();
     gDoneQ = [NSMutableSet set];
     [NSTimer scheduledTimerWithTimeInterval:0.2
                                     repeats:YES
