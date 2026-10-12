@@ -485,7 +485,23 @@ static NSDictionary *loadAIConfig(void) {
     NSData *d = [NSData dataWithContentsOfFile:aaConfigPath()];
     if (!d) return nil;
     id o = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-    return [o isKindOfClass:[NSDictionary class]] ? o : nil;
+    if (![o isKindOfClass:[NSDictionary class]]) return nil;
+    NSMutableDictionary *m = [o mutableCopy];
+    // 退役/不推荐的模型名自动纠偏（deepseek-chat、deepseek-reasoner 已于 2026-07-24 退役）
+    NSString *mdl = [m[@"model"] isKindOfClass:[NSString class]] ? m[@"model"] : @"";
+    if (mdl.length == 0 ||
+        [mdl isEqualToString:@"deepseek-chat"] || [mdl isEqualToString:@"deepseek-reasoner"] ||
+        [mdl isEqualToString:@"deepseek-v4-flash"]) {
+        NSString *old = mdl.length ? mdl : @"(空)";
+        m[@"model"] = @"deepseek-flash";
+        @try {
+            NSData *nd = [NSJSONSerialization dataWithJSONObject:m
+                                                         options:NSJSONWritingPrettyPrinted error:nil];
+            if (nd) [nd writeToFile:aaConfigPath() atomically:YES];
+        } @catch (NSException *e) {}
+        aaLog(@"[配置] 模型名 %@ 已过时/不可用 → 已自动改为 deepseek-flash 并写回配置文件", old);
+    }
+    return m;
 }
 static void ensureConfigFile(void) {
     NSString *p = aaConfigPath();
