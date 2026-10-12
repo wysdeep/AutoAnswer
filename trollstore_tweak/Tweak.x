@@ -582,6 +582,34 @@ static void tick(void) {
     NSMutableArray *textFrames = [NSMutableArray array];
     scanScreen(all, tappables, textFrames);
 
+    // ===== 空间过滤：只看屏幕中上部「答题弹窗带」，硬排除左下角聊天/弹幕区与顶部状态区 =====
+    // 思路：答题弹窗在屏幕中部，聊天窗口在左下角 —— 按坐标切比按文字内容猜更可靠。
+    CGRect sb = [UIScreen mainScreen].bounds;
+    CGFloat SW = sb.size.width, SH = sb.size.height;
+    NSUInteger tapAll = tappables.count, txtAll = textFrames.count;
+    {
+        NSMutableArray *tapC = [NSMutableArray array];
+        for (NSArray *p in tappables) {
+            if (p.count < 3) continue;
+            CGRect f = [(NSValue *)p[2] CGRectValue];
+            CGFloat cx = CGRectGetMidX(f), cy = CGRectGetMidY(f);
+            if (cx < SW * 0.04 || cx > SW * 0.96) continue;
+            if (cy < SH * 0.06 || cy > SH * 0.80) continue;   // 去掉底部 20%（聊天区）
+            [tapC addObject:p];
+        }
+        NSMutableArray *txtC = [NSMutableArray array];
+        for (NSArray *p in textFrames) {
+            if (p.count < 3) continue;
+            CGRect f = [(NSValue *)p[1] CGRectValue];
+            CGFloat cx = CGRectGetMidX(f), cy = CGRectGetMidY(f);
+            if (cx < SW * 0.04 || cx > SW * 0.96) continue;
+            if (cy < SH * 0.06 || cy > SH * 0.80) continue;
+            [txtC addObject:p];
+        }
+        [tappables setArray:tapC];
+        [textFrames setArray:txtC];
+    }
+
     // ===== 定位答题弹窗：以确认按钮为锚点 =====
     static NSArray *nonOptionWords = nil;
     static dispatch_once_t onceNon;
@@ -666,11 +694,28 @@ static void tick(void) {
         NSDate *now = [NSDate date];
         if (!gLastDiag2 || [now timeIntervalSinceDate:gLastDiag2] > 2.0) {
             gLastDiag2 = now;
-            aaLog(@"[诊断] 文字%lu 载体%lu 可点%lu | 有题=%@ 确认=%@ 选项%lu 题干=%@",
-                  (unsigned long)all.length, (unsigned long)tappables.count, (unsigned long)options.count,
+            aaLog(@"[诊断] 中部区 可点%lu/%lu 文字%lu/%lu | 有题=%@ 确认=%@ 选项%lu 题干=%@",
+                  (unsigned long)tappables.count, (unsigned long)tapAll,
+                  (unsigned long)textFrames.count, (unsigned long)txtAll,
                   hasQuiz ? @"是" : @"否",
                   confirmText.length ? confirmText : (confirm ? @"有" : @"无"),
                   (unsigned long)options.count, qText.length ? qText : @"-");
+            {
+                // 中部文字地图：到底中间能不能读到选项，看这一行就够（8s 节流）
+                static NSDate *gLastMap = nil;
+                if (!gLastMap || [now timeIntervalSinceDate:gLastMap] > 8.0) {
+                    gLastMap = now;
+                    NSMutableArray *m = [NSMutableArray array];
+                    for (NSArray *p in textFrames) {
+                        if (p.count < 3) continue;
+                        if (m.count >= 20) break;
+                        CGRect f = [(NSValue *)p[1] CGRectValue];
+                        [m addObject:[NSString stringWithFormat:@"「%@」@(%.0f,%.0f)",
+                                      p[0], CGRectGetMidX(f), CGRectGetMidY(f)]];
+                    }
+                    aaLog(@"[地图] 屏中部文字：%@", m);
+                }
+            }
             if (confirm && options.count < 2) {
                 // 找到了确认钮但选项不够 → dump 确认钮上方的所有可点项，便于定位区域问题
                 NSMutableArray *dbg = [NSMutableArray array];
