@@ -483,26 +483,35 @@ static NSString *aaQuizJS(void) {
         js = @"(function(){"
         "function txt(e){return (e.innerText||e.textContent||'').trim();}"
         "var all=[].slice.call(document.querySelectorAll('*'));"
-        "var clickable=all.filter(function(e){var t=txt(e);"
-        "return t.length>=1&&t.length<=40&&(e.tagName==='BUTTON'||e.tagName==='A'||e.getAttribute('role')==='button'||e.onclick);});"
-        "var non=/确认提交|提交答案|交卷|提交|我知道了|知道了|确定|关闭|取消|下一题|跳过|换一换|返回|首页/;"
-        "var seen={},uniq=[];"
-        "clickable.forEach(function(e){var t=txt(e);if(!non.test(t)&&!seen[t]){seen[t]=1;uniq.push(e);}});"
-        "var body=(document.body&&document.body.innerText)?document.body.innerText:'';"
-        "var q=body.slice(0,200);"
-        "var n=1,m=q.match(/哪\\s*([0-9]|一|二|两|三|四|五|六|七|八|九|十)\\s*[个种项]?/);"
+        "var cand=[];"
+        "all.forEach(function(e){var t=txt(e);if(t&&t.length<=80)cand.push({e:e,t:t});});"
+        "var qi=-1,qt='';"
+        "cand.forEach(function(c,i){if((c.t.indexOf('？')>=0||c.t.indexOf('?')>=0)&&c.t.length>qt.length){qt=c.t;qi=i;}});"
+        "var si=-1;"
+        "cand.forEach(function(c,i){if(si<0&&/^(确认提交|提交答案|提交)$/.test(c.t))si=i;});"
+        "if(si<0)return JSON.stringify({err:'no-submit'});"
+        "var start=qi>=0?qi+1:0,opts=[];"
+        "for(var i=start;i<si;i++){var t=cand[i].t;"
+        " if(!t||t.length>30)continue;"
+        " if(t.indexOf('\\n')>=0)continue;"
+        " if(/^\\d+\\s*s$/.test(t))continue;"
+        " if(/规则|剩余|答题时间|倒计时|关闭|取消|返回|首页|我知道|提交/.test(t))continue;"
+        " opts.push(cand[i]);}"
+        "var n=1,m=qt.match(/哪\\s*([0-9]|一|二|两|三|四|五|六|七|八|九|十)\\s*[个种项]?/);"
         "if(m){var c=m[1],map={'一':1,'二':2,'两':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10};"
         "n=(/[0-9]/.test(c))?parseInt(c,10):(map[c]||1);}"
-        "var pool=uniq.slice(0,8),clicked=[];"
-        "if(n>=pool.length){pool.forEach(function(e){try{e.click();clicked.push(txt(e));}catch(_){}});}"
-        "else{var used={};while(clicked.length<n&&Object.keys(used).length<pool.length){var i=Math.floor(Math.random()*pool.length);if(used[i])continue;used[i]=1;try{pool[i].click();clicked.push(txt(pool[i]));}catch(_){}}}"
+        "var clicked=[],used={};"
+        "if(n>=opts.length){opts.forEach(function(o){try{o.e.click();clicked.push(o.t);}catch(_){}});}"
+        "else{while(clicked.length<n&&Object.keys(used).length<opts.length){var i=Math.floor(Math.random()*opts.length);if(used[i])continue;used[i]=1;try{opts[i].e.click();clicked.push(opts[i].t);}catch(_){}}}"
         "var sub='no-submit';"
-        "for(var i=0;i<clickable.length;i++){var t=txt(clickable[i]);if(/确认提交|提交答案|交卷|^提交$/.test(t)&&t.length<=12){try{clickable[i].click();sub='clicked:'+t;}catch(_){sub='err';}break;}}"
-        "return JSON.stringify({q:q.slice(0,120),opts:pool.map(txt),clicked:clicked,submit:sub});"
+        "try{cand[si].e.click();sub='clicked:'+cand[si].t;}catch(_){sub='err';}"
+        "return JSON.stringify({q:qt.slice(0,80),opts:opts.map(function(o){return o.t;}),clicked:clicked,submit:sub});"
         "})()";
     });
     return js;
 }
+
+static NSString *gLastWebQ = nil;   // 最近已答过的 H5 题干，用于判重
 
 static void tryWebViewQuiz(void) {
     @try {
@@ -530,7 +539,21 @@ static void tryWebViewQuiz(void) {
                               ([txt containsString:@"答题"] &&
                                ([txt containsString:@"剩余"] || [txt containsString:@"提交"]));
                 if (!isQuiz) return;
-                aaLog(@"[H5] 检测到答题页，DOM(前 300 字)：%@",
+                // 提取题干：含「？」的最长行，作为「同一题」的判重键
+                NSString *qKey = @"";
+                for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
+                    NSString *s = [line stringByTrimmingCharactersInSet:
+                                   [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                    if (([s containsString:@"？"] || [s containsString:@"?"]) && s.length > qKey.length)
+                        qKey = s;
+                }
+                if (qKey.length == 0) qKey = [txt substringToIndex:MIN((NSUInteger)60, txt.length)];
+
+                if (gLastWebQ && [qKey isEqualToString:gLastWebQ]) return;  // 同一题已答过，绝不再点
+                gLastWebQ = qKey;
+
+                aaLog(@"[H5] 检测到新题：%@", qKey);
+                aaLog(@"[H5] DOM(前 300 字)：%@",
                       txt.length > 300 ? [txt substringToIndex:300] : txt);
                 webViewRunJS(wv, aaQuizJS(), ^(NSString *r){
                     aaLog(@"[H5] 作答结果：%@", r ? r : @"无返回");
