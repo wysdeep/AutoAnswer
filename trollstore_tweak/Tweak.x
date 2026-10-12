@@ -630,28 +630,143 @@ static NSString *aaQuizJS(BOOL doClick, NSString *answer) {
         "var si=-1;"
         "cand.forEach(function(c,i){if(si<0&&/^(确认提交|提交答案|提交)$/.test(c.t))si=i;});"
         "if(si<0)return JSON.stringify({err:'no-submit'});"
-        "var start=qi>=0?qi+1:0,opts=[];"
-        "for(var i=start;i<si;i++){var t=cand[i].t;"
+        "var start=qi>=0?qi+1:0,opts=[],seen={};"
+        "for(var i=si-1;i>=start;i--){var t=cand[i].t;"
         " if(!t||t.length>30)continue;"
         " if(t.indexOf('\\n')>=0)continue;"
+        " if(t===qt)continue;"
         " if(/^\\d+\\s*s$/.test(t))continue;"
         " if(/规则|剩余|答题时间|倒计时|关闭|取消|返回|首页|我知道|提交/.test(t))continue;"
-        " opts.push(cand[i]);}"
+        " if(seen[t])continue;"
+        " seen[t]=1;opts.push(cand[i]);}"
+        "opts.reverse();"
         "var names=opts.map(function(o){return o.t;});";
     if (!doClick) {
         return [head stringByAppendingString:@"return JSON.stringify({q:qt,opts:names});})()"];
     }
     NSString *tail = [NSString stringWithFormat:
-        @"var want='%@';"
+        @"function pt(el){var r=el.getBoundingClientRect();"
+        " return [Math.round(r.left+r.width/2),Math.round(r.top+r.height/2)];}"
+        "function fire(el){"
+        " var c=pt(el),cx=c[0],cy=c[1];"
+        " try{var t=new Touch({identifier:1,target:el,clientX:cx,clientY:cy,"
+        "  pageX:cx+window.pageXOffset,pageY:cy+window.pageYOffset});"
+        "  el.dispatchEvent(new TouchEvent('touchstart',{bubbles:true,cancelable:true,"
+        "   touches:[t],targetTouches:[t],changedTouches:[t]}));"
+        "  el.dispatchEvent(new TouchEvent('touchend',{bubbles:true,cancelable:true,"
+        "   touches:[],targetTouches:[],changedTouches:[t]}));}catch(_){}"
+        " try{el.dispatchEvent(new MouseEvent('pointerdown',{bubbles:true,cancelable:true,view:window,"
+        "   clientX:cx,clientY:cy,buttons:1}));"
+        "  el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true,view:window,"
+        "   clientX:cx,clientY:cy,buttons:1}));"
+        "  el.dispatchEvent(new MouseEvent('pointerup',{bubbles:true,cancelable:true,view:window,"
+        "   clientX:cx,clientY:cy}));"
+        "  el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true,cancelable:true,view:window,"
+        "   clientX:cx,clientY:cy}));"
+        "  el.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window,"
+        "   clientX:cx,clientY:cy}));}catch(_){}"
+        " try{el.click();}catch(_){}"
+        "}"
+        "var want='%@';"
         "var hit=null;"
         "if(want){opts.forEach(function(o){if(!hit&&(o.t===want||o.t.indexOf(want)>=0||want.indexOf(o.t)>=0))hit=o;});}"
         "if(!hit&&opts.length){hit=opts[Math.floor(Math.random()*opts.length)];}"
         "var clicked=[];"
-        "if(hit){try{hit.e.click();clicked.push(hit.t);}catch(_){}}"
-        "var sub='no-submit';"
-        "try{cand[si].e.click();sub='clicked:'+cand[si].t;}catch(_){sub='err';}"
-        "return JSON.stringify({q:qt,opts:names,want:want,clicked:clicked,submit:sub});})()", safe];
+        "if(hit){try{fire(hit.e);clicked.push(hit.t+'#'+(hit.e.tagName||'?'));}catch(_){}}"
+        "return JSON.stringify({q:qt,opts:names,want:want,clicked:clicked});})()", safe];
     return [head stringByAppendingString:tail];
+}
+
+// ---- 单独点「确认提交」：重新查 DOM、挑最内层可点元素、强制解除 disabled、补发真实 Touch/Mouse 事件 ----
+// mode 0=按钮本体  1=外层容器  2=按钮中心坐标处最顶层元素（真实手指会点到的那个）
+static NSString *aaSubmitJS(int mode) {
+    return [NSString stringWithFormat:
+    @"(function(){"
+    "function txt(e){return (e.innerText||e.textContent||'').trim();}"
+    "var all=[].slice.call(document.querySelectorAll('*'));"
+    "var cand=[];"
+    "all.forEach(function(e){var t=txt(e);"
+    " if(t&&t.length<=12&&/^(确认提交|提交答案|提交|确认)$/.test(t))cand.push(e);});"
+    "if(!cand.length)return JSON.stringify({err:'no-submit',mode:%d});"
+    "var btn=null;"
+    "for(var i=cand.length-1;i>=0;i--){var tg=(cand[i].tagName||'').toUpperCase();"
+    " if(tg==='BUTTON'||tg==='A'){btn=cand[i];break;}}"
+    "if(!btn)btn=cand[cand.length-1];"
+    "var el=btn,up=0;"
+    "if(%d===1){var p=btn.parentElement;"
+    " while(p&&p!==document.body&&up<4&&(p.innerText||'').trim().length>40)p=p.parentElement,up++;"
+    " if(p)el=p;}"
+    "if(%d===2){var r0=btn.getBoundingClientRect();"
+    " var hit=document.elementFromPoint(Math.round(r0.left+r0.width/2),Math.round(r0.top+r0.height/2));"
+    " if(hit)el=hit;}"
+    "var wasDisabled=false;"
+    "try{wasDisabled=!!(el.disabled||el.getAttribute('disabled')!==null||el.getAttribute('aria-disabled')==='true');"
+    " el.disabled=false;el.removeAttribute('disabled');el.removeAttribute('aria-disabled');"
+    " if(el.classList)el.classList.remove('disabled');"
+    " var pe=el.parentElement;"
+    " if(pe){try{pe.disabled=false;pe.removeAttribute('disabled');"
+    "  if(pe.classList)pe.classList.remove('disabled');}catch(_){}}}catch(_){}"
+    "var r=el.getBoundingClientRect();"
+    "var cx=Math.round(r.left+r.width/2),cy=Math.round(r.top+r.height/2);"
+    "try{var t=new Touch({identifier:1,target:el,clientX:cx,clientY:cy,"
+    " pageX:cx+window.pageXOffset,pageY:cy+window.pageYOffset});"
+    " el.dispatchEvent(new TouchEvent('touchstart',{bubbles:true,cancelable:true,"
+    "  touches:[t],targetTouches:[t],changedTouches:[t]}));"
+    " el.dispatchEvent(new TouchEvent('touchend',{bubbles:true,cancelable:true,"
+    "  touches:[],targetTouches:[],changedTouches:[t]}));}catch(_){}"
+    "try{el.dispatchEvent(new MouseEvent('pointerdown',{bubbles:true,cancelable:true,view:window,"
+    "  clientX:cx,clientY:cy,buttons:1}));"
+    " el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true,view:window,"
+    "  clientX:cx,clientY:cy,buttons:1}));"
+    " el.dispatchEvent(new MouseEvent('pointerup',{bubbles:true,cancelable:true,view:window,"
+    "  clientX:cx,clientY:cy}));"
+    " el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true,cancelable:true,view:window,"
+    "  clientX:cx,clientY:cy}));"
+    " el.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window,"
+    "  clientX:cx,clientY:cy}));}catch(_){}"
+    "var ok='no';try{el.click();ok='clicked';}catch(_){ok='err';}"
+    "return JSON.stringify({submit:ok,text:(txt(el)||'').slice(0,20),tag:(el.tagName||''),"
+    " wasDisabled:wasDisabled,stillDisabled:!!el.disabled,x:cx,y:cy,up:up,mode:%d});"
+    "})()", mode, mode, mode, mode];
+}
+
+// ---- 先点选项，隔 0.35s 等页面状态刷新，再点提交；0.8s 后复查，没提交出去就改点外层容器重试 ----
+static void answerAndSubmit(WKWebView *wv, NSString *answer, NSString *qkey) {
+    webViewRunJS(wv, aaQuizJS(YES, answer), ^(NSString *r){
+        aaLog(@"[H5] 选项点击结果：%@", r ? r : @"无返回");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.40 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            webViewRunJS(wv, aaSubmitJS(0), ^(NSString *r2){
+                aaLog(@"[H5] 提交结果(mode0)：%@", r2 ? r2 : @"无返回");
+                // 0.8s 后复查：还在本题就逐级重试 —— 外层容器 → 坐标处最顶层元素
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    webViewRunJS(wv, @"document.body.innerText", ^(NSString *t){
+                        BOOL still = t && ([t containsString:@"确认提交"] || [t containsString:@"提交答案"]);
+                        if (still && qkey.length == 0) still = NO;                        // 没题干就不乱点
+                        if (still && qkey.length && ![t containsString:qkey]) still = NO;  // 已换题别乱点
+                        if (!still) { aaLog(@"[H5] 已离开本题 → 提交成功"); return; }
+                        aaLog(@"[H5] 提交后仍在本题 → 重试 mode1（外层容器）");
+                        webViewRunJS(wv, aaSubmitJS(1), ^(NSString *r3){
+                            aaLog(@"[H5] 提交结果(mode1)：%@", r3 ? r3 : @"无返回");
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                                           dispatch_get_main_queue(), ^{
+                                webViewRunJS(wv, @"document.body.innerText", ^(NSString *t2){
+                                    BOOL s2 = t2 && ([t2 containsString:@"确认提交"] || [t2 containsString:@"提交答案"]);
+                                    if (s2 && qkey.length && ![t2 containsString:qkey]) s2 = NO;
+                                    if (!s2) { aaLog(@"[H5] 已离开本题 → 提交成功(mode1)"); return; }
+                                    aaLog(@"[H5] 仍在本题 → 最后重试 mode2（坐标顶层元素）");
+                                    webViewRunJS(wv, aaSubmitJS(2), ^(NSString *r4){
+                                        aaLog(@"[H5] 提交结果(mode2)：%@", r4 ? r4 : @"无返回");
+                                    });
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
 }
 
 static NSString *gLastWebQ = nil;   // 最近已答过的 H5 题干，用于判重
@@ -714,9 +829,7 @@ static void tryWebViewQuiz(void) {
                     // 兜底：读不到选项 / 没配 key → 直接随机点，绝不空过
                     void (^justRandom)(NSString *) = ^(NSString *why){
                         aaLog(@"[H5] %@ → 随机作答", why);
-                        webViewRunJS(wv, aaQuizJS(YES, nil), ^(NSString *r){
-                            aaLog(@"[H5] 作答结果：%@", r ? r : @"无返回");
-                        });
+                        answerAndSubmit(wv, nil, q);
                     };
                     if (!opts || opts.count == 0) { justRandom(@"读不到选项"); return; }
 
@@ -724,9 +837,7 @@ static void tryWebViewQuiz(void) {
                     NSString *cached = cacheLookup(q);
                     if (cached.length) {
                         aaLog(@"[缓存] 命中（0ms，不联网）：%@ → %@", q, cached);
-                        webViewRunJS(wv, aaQuizJS(YES, cached), ^(NSString *r){
-                            aaLog(@"[H5] 作答结果(缓存)：%@", r ? r : @"无返回");
-                        });
+                        answerAndSubmit(wv, cached, q);
                         return;
                     }
 
@@ -750,9 +861,7 @@ static void tryWebViewQuiz(void) {
                             cacheRemember(q, ans);      // 记住，下次 0ms
                             aaLog(@"[缓存] 已记住本题，下次遇到直接秒答");
                         }
-                        webViewRunJS(wv, aaQuizJS(YES, ans), ^(NSString *r){
-                            aaLog(@"[H5] 作答结果：%@", r ? r : @"无返回");
-                        });
+                        answerAndSubmit(wv, ans, q);
                     };
                     askAI(q, opts, cfg, ^(NSString *ans){ finish(ans); });
                     // 超时兜底：AI 没按时回就立刻随机点，保证不空过
