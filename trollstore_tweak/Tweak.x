@@ -524,7 +524,7 @@ static NSDictionary *loadAIConfig(void) {
         [mdl isEqualToString:@"deepseek-chat"] || [mdl isEqualToString:@"deepseek-reasoner"] ||
         [mdl isEqualToString:@"deepseek-v4-flash"]) {
         NSString *nm = @"deepseek-flash";
-        if      ([api containsString:@"bigmodel"])    nm = @"glm-4.5-flash";
+        if      ([api containsString:@"bigmodel"])     nm = @"glm-4.6";
         else if ([api containsString:@"siliconflow"])  nm = @"Qwen/Qwen2.5-7B-Instruct";
         else if ([api containsString:@"modelscope"])   nm = @"Qwen/Qwen2.5-7B-Instruct";
         NSString *old = mdl.length ? mdl : @"(空)";
@@ -536,16 +536,40 @@ static NSDictionary *loadAIConfig(void) {
         } @catch (NSException *e) {}
         aaLog(@"[配置] 模型名 %@ 已过时/为空 → 已自动改为 %@ 并写回配置文件", old, nm);
     }
-    // 超时太短在手机网络上几乎必超时（实测 1.5s 不够），低于 2.0 统一抬到 2.0 并写回
+    // 智谱：2026-10-13 晚高峰实测——免费 flash 系列 6.9~26s 才回（还常 429），
+    // 而且对美妆产品题会答错；glm-4.6 只要 2.6~4.7s 且答对。主模型升级 + 加 0.5s 的 air 兜底。
+    if ([api containsString:@"bigmodel"]) {
+        BOOL wr = NO;
+        if ([mdl isEqualToString:@"glm-4.5-flash"] || [mdl isEqualToString:@"glm-4.7-flash"]) {
+            m[@"model"] = @"glm-4.6";
+            wr = YES;
+            aaLog(@"[配置] 智谱免费模型晚高峰实测 6.9~26s 且答错 → 主模型改为 glm-4.6（按量计费，一题约千分之一元）");
+        }
+        NSString *m2 = [m[@"model2"] isKindOfClass:[NSString class]] ? m[@"model2"] : @"";
+        if (m2.length == 0) {
+            m[@"model2"] = @"glm-4.5-air";
+            wr = YES;
+            aaLog(@"[配置] 备用模型设为 glm-4.5-air（实测 0.5s，主模型没赶上时用它兜底）");
+        }
+        if (wr) {
+            @try {
+                NSData *nd = [NSJSONSerialization dataWithJSONObject:m
+                                                             options:NSJSONWritingPrettyPrinted error:nil];
+                if (nd) [nd writeToFile:aaConfigPath() atomically:YES];
+            } @catch (NSException *e) {}
+        }
+    }
+    // 超时太短必超时（2026-10-13 晚高峰：免费接口 6.9~26s，glm-4.6 也要 2.6~4.7s）。
+    // 答题窗口约 20s，给 6s 完全来得及；低于 4.0 统一抬到 4.0 并写回。
     double tv = [m[@"timeout"] respondsToSelector:@selector(doubleValue)] ? [m[@"timeout"] doubleValue] : 0;
-    if (tv < 2.0) {
-        m[@"timeout"] = @2.0;
+    if (tv < 4.0) {
+        m[@"timeout"] = @6.0;
         @try {
             NSData *td = [NSJSONSerialization dataWithJSONObject:m
                                                          options:NSJSONWritingPrettyPrinted error:nil];
             if (td) [td writeToFile:aaConfigPath() atomically:YES];
         } @catch (NSException *e) {}
-        aaLog(@"[配置] 超时 %.1fs 太短（手机网络实测不够）→ 已自动改为 2.0s", tv);
+        aaLog(@"[配置] 超时 %.1fs 太短（实测不够）→ 已自动改为 6.0s（答题窗口约 20s，来得及）", tv);
     }
     return m;
 }
@@ -553,10 +577,11 @@ static void ensureConfigFile(void) {
     NSString *p = aaConfigPath();
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) return;
     // 默认给智谱免费档：注册就有免费额度，不需要充值
-    NSDictionary *def = @{@"api":    @"https://open.bigmodel.cn/api/paas/v4/chat/completions",
-                          @"key":    @"",
-                          @"model":  @"glm-4.5-flash",
-                          @"timeout": @2.0};
+    NSDictionary *def = @{@"api":     @"https://open.bigmodel.cn/api/paas/v4/chat/completions",
+                          @"key":     @"",
+                          @"model":   @"glm-4.6",
+                          @"model2":  @"glm-4.5-air",
+                          @"timeout": @6.0};
     NSData *d = [NSJSONSerialization dataWithJSONObject:def
                                                 options:NSJSONWritingPrettyPrinted error:nil];
     if (d && [d writeToFile:p atomically:YES])
@@ -570,14 +595,14 @@ static void ensureConfigFile(void) {
 
 static NSArray<NSDictionary *> *aaPresets(void) {
     return @[
-        @{@"name": @"智谱·免费",  @"api": @"https://open.bigmodel.cn/api/paas/v4/chat/completions",
-          @"model": @"glm-4.5-flash"},
+        @{@"name": @"智谱",       @"api": @"https://open.bigmodel.cn/api/paas/v4/chat/completions",
+          @"model": @"glm-4.6",  @"model2": @"glm-4.5-air"},
         @{@"name": @"DeepSeek",   @"api": @"https://api.deepseek.com/chat/completions",
-          @"model": @"deepseek-flash"},
+          @"model": @"deepseek-flash", @"model2": @""},
         @{@"name": @"硅基流动",   @"api": @"https://api.siliconflow.cn/v1/chat/completions",
-          @"model": @"Qwen/Qwen2.5-7B-Instruct"},
-        @{@"name": @"魔搭·免费",  @"api": @"https://api-inference.modelscope.cn/v1/chat/completions",
-          @"model": @"Qwen/Qwen2.5-7B-Instruct"},
+          @"model": @"Qwen/Qwen2.5-7B-Instruct", @"model2": @""},
+        @{@"name": @"魔搭",       @"api": @"https://api-inference.modelscope.cn/v1/chat/completions",
+          @"model": @"Qwen/Qwen2.5-7B-Instruct", @"model2": @""},
     ];
 }
 
@@ -688,6 +713,7 @@ static void aaTestConnection(NSString *api, NSString *model, NSString *key,
 @property (nonatomic, strong) NSMutableArray *pBtns;
 @property (nonatomic, strong) NSString *api;
 @property (nonatomic, strong) NSString *model;
+@property (nonatomic, strong) NSString *model2;
 @end
 
 @implementation AACfgVC
@@ -767,8 +793,8 @@ static void aaTestConnection(NSString *api, NSString *model, NSString *key,
     [card addSubview:kf];
     self.keyF = kf;
 
-    UILabel *info = [[UILabel alloc] initWithFrame:CGRectMake(16, 224, CW - 32, 66)];
-    info.numberOfLines = 4;
+    UILabel *info = [[UILabel alloc] initWithFrame:CGRectMake(16, 222, CW - 32, 74)];
+    info.numberOfLines = 5;
     info.font = [UIFont systemFontOfSize:12];
     info.textColor = [UIColor colorWithWhite:0.86 alpha:1];
     [card addSubview:info];
@@ -776,24 +802,26 @@ static void aaTestConnection(NSString *api, NSString *model, NSString *key,
 
     CGFloat bw = (CW - 32 - 10) / 2;
     [card addSubview:[self mkBtn:@"测试连接"
-                           frame:CGRectMake(16, 298, bw, 40)
+                           frame:CGRectMake(16, 302, bw, 40)
                               bg:[UIColor colorWithRed:0.20 green:0.45 blue:0.75 alpha:1]
                              sel:@selector(testTapped)]];
     [card addSubview:[self mkBtn:@"取消"
-                           frame:CGRectMake(16 + bw + 10, 298, bw, 40)
+                           frame:CGRectMake(16 + bw + 10, 302, bw, 40)
                               bg:[UIColor colorWithWhite:0.35 alpha:1]
                              sel:@selector(cancelTapped)]];
     [card addSubview:[self mkBtn:@"保存并开启"
-                           frame:CGRectMake(16, 346, CW - 32, 44)
+                           frame:CGRectMake(16, 350, CW - 32, 44)
                               bg:[UIColor colorWithRed:0.15 green:0.62 blue:0.30 alpha:1]
                              sel:@selector(saveTapped)]];
 
     NSDictionary *cfg = loadAIConfig();
-    NSString *api   = [cfg[@"api"]   isKindOfClass:[NSString class]] ? cfg[@"api"]   : @"";
-    NSString *model = [cfg[@"model"] isKindOfClass:[NSString class]] ? cfg[@"model"] : @"";
-    NSString *key   = [cfg[@"key"]   isKindOfClass:[NSString class]] ? cfg[@"key"]   : @"";
-    self.api   = api.length   ? api   : ps[0][@"api"];
-    self.model = model.length ? model : ps[0][@"model"];
+    NSString *api   = [cfg[@"api"]    isKindOfClass:[NSString class]] ? cfg[@"api"]    : @"";
+    NSString *model = [cfg[@"model"]  isKindOfClass:[NSString class]] ? cfg[@"model"]  : @"";
+    NSString *mod2  = [cfg[@"model2"] isKindOfClass:[NSString class]] ? cfg[@"model2"] : @"";
+    NSString *key   = [cfg[@"key"]    isKindOfClass:[NSString class]] ? cfg[@"key"]    : @"";
+    self.api    = api.length    ? api    : ps[0][@"api"];
+    self.model  = model.length  ? model  : ps[0][@"model"];
+    self.model2 = mod2.length   ? mod2   : (ps[0][@"model2"] ?: @"");
     self.keyF.text = key;
 
     // 选中当前 api 对应的预设按钮
@@ -824,14 +852,16 @@ static void aaTestConnection(NSString *api, NSString *model, NSString *key,
     else                    kd = [NSString stringWithFormat:
                 @"%lu 个（自动轮换，被限流会换下一个）", (unsigned long)ks.count];
     self.infoL.text = [NSString stringWithFormat:
-        @"渠道：%@\n模型：%@\nKey：%@\n超时：2.0s（手机网络实测够用）",
-        self.api, self.model, kd];
+        @"渠道：%@\n主模型：%@\n备用模型：%@\nKey：%@\n超时：6s（按页面剩余时间自动收紧）",
+        self.api, self.model,
+        self.model2.length ? self.model2 : @"（无）", kd];
 }
 
 - (void)preset:(UIButton *)b {
     NSDictionary *p = aaPresets()[b.tag];
     self.api = p[@"api"];
     self.model = p[@"model"];
+    self.model2 = p[@"model2"] ?: @"";
     [self markPreset:b.tag];
     [self refreshInfo];
 }
@@ -861,9 +891,10 @@ static void aaTestConnection(NSString *api, NSString *model, NSString *key,
     NSMutableDictionary *cfg = [NSMutableDictionary dictionary];
     cfg[@"api"]     = self.api;
     cfg[@"model"]   = self.model;
+    if (self.model2.length) cfg[@"model2"] = self.model2;
     cfg[@"key"]     = ks.firstObject;
     if (ks.count > 1) cfg[@"keys"] = ks;
-    cfg[@"timeout"] = @2.0;
+    cfg[@"timeout"] = @6.0;
     BOOL ok = NO;
     @try {
         NSData *d = [NSJSONSerialization dataWithJSONObject:cfg
@@ -1266,6 +1297,45 @@ static void askAIWithKey(NSString *question, NSArray *opts, NSDictionary *cfg, B
     }
 }
 
+// ---- 双模型接力：主模型准但慢（glm-4.6 约 2.6~4.7s），备用模型快但差些（glm-4.5-air 约 0.5s）。
+//      两个同时发出去跑；主模型一回来就用主模型的；主模型没赶上预算、或失败了，才用备用的；
+//      都没有才轮到随机。备用结果先攥在手里不提交，绝不因为"快的先回来"就把准的扔了。
+static void askAIDual(NSString *question, NSArray *opts, NSDictionary *cfg, BOOL isMulti,
+                      double budget, void (^cb)(NSString *)) {
+    NSString *m1 = [cfg[@"model"]  isKindOfClass:[NSString class]] ? cfg[@"model"]  : @"";
+    NSString *m2 = [cfg[@"model2"] isKindOfClass:[NSString class]] ? cfg[@"model2"] : @"";
+    if (m2.length == 0 || [m2 isEqualToString:m1]) {
+        askAI(question, opts, cfg, isMulti, cb);   // 没配备用模型就单发主模型
+        return;
+    }
+    @try {
+        NSMutableDictionary *c1  = [cfg mutableCopy]; c1[@"model"]  = m1;
+        NSMutableDictionary *c2b = [cfg mutableCopy]; c2b[@"model"] = m2;
+        __block BOOL done = NO;
+        __block BOOL primDone = NO, bkDone = NO;
+        __block NSString *primAns = nil, *bkAns = nil;
+        void (^resolve)(void) = ^{
+            if (done) return;
+            if (primDone && primAns.length) { done = YES; cb(primAns); return; }
+            if (primDone && bkDone) { done = YES; cb(bkAns.length ? bkAns : nil); return; }
+        };
+        aaLog(@"[AI] 双模型接力：主 %@（准）+ 备 %@（快）｜预算 %.1fs", m1, m2, budget);
+        askAI(question, opts, c1,  isMulti, ^(NSString *a){ primDone = YES; primAns = a; resolve(); });
+        askAI(question, opts, c2b, isMulti, ^(NSString *a){ if (done) return; bkDone = YES; bkAns = a; resolve(); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(budget * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (done) return;
+            done = YES;
+            NSString *a = primAns.length ? primAns : (bkAns.length ? bkAns : nil);
+            aaLog(@"[AI] %.1fs 预算到点 → %@", budget, a.length ? @"采用已有结果" : @"没有结果，随机兜底");
+            cb(a);
+        });
+    } @catch (NSException *e) {
+        aaLog(@"[异常] askAIDual：%@", e);
+        if (cb) cb(nil);
+    }
+}
+
 // ---- 组装 JS：doClick=NO 只读题面与选项；doClick=YES 点指定答案(answer 为空则随机)再提交 ----
 static NSString *aaQuizJS(BOOL doClick, NSString *answer) {
     NSString *safe = @"";
@@ -1310,9 +1380,11 @@ static NSString *aaQuizJS(BOOL doClick, NSString *answer) {
         "var multi=false;"
         "all.forEach(function(e){if(multi)return;var t=txt(e);"
         " if(t&&t.length<=6&&t.indexOf('多选')>=0)multi=true;});"
-        "if(!multi&&qt&&qt.indexOf('多选')>=0)multi=true;";
+        "if(!multi&&qt&&qt.indexOf('多选')>=0)multi=true;"
+        "var left=0;"
+        "for(var i=si-1;i>=0;i--){var m=/^(\\d{1,2})s$/.exec(cand[i].t);if(m){left=parseInt(m[1],10);break;}}";
     if (!doClick) {
-        return [head stringByAppendingString:@"return JSON.stringify({q:qt,opts:names,multi:multi});})()"];
+        return [head stringByAppendingString:@"return JSON.stringify({q:qt,opts:names,multi:multi,left:left});})()"];
     }
     NSString *tail = [NSString stringWithFormat:
         @"function pt(el){var r=el.getBoundingClientRect();"
@@ -1359,7 +1431,7 @@ static NSString *aaQuizJS(BOOL doClick, NSString *answer) {
         "try{opts.forEach(function(o){var c=o.e.className||'';"
         " if(typeof c!=='string')c=String(c);"
         " if(/select|active|checked|chosen|picked|cur|on\\b|highlight/i.test(c))sel.push(o.t);});}catch(_){}"
-        "return JSON.stringify({q:qt,opts:names,want:want,multi:multi,"
+        "return JSON.stringify({q:qt,opts:names,want:want,multi:multi,left:left,"
         " n:hits.length,clicked:clicked,sel:sel});})()", safe];
     return [head stringByAppendingString:tail];
 }
@@ -1568,6 +1640,7 @@ static void tryWebViewQuiz(void) {
                     NSString *q = qKey;
                     NSArray *opts = nil;
                     BOOL isMulti = NO;
+                    double leftSec = 0;   // 页面上的剩余答题秒数（读不到就是 0）
                     if (info) {
                         id j = [NSJSONSerialization JSONObjectWithData:
                                 [info dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
@@ -1575,6 +1648,8 @@ static void tryWebViewQuiz(void) {
                             if ([j[@"q"] isKindOfClass:[NSString class]] && [j[@"q"] length]) q = j[@"q"];
                             if ([j[@"opts"] isKindOfClass:[NSArray class]]) opts = j[@"opts"];
                             isMulti = [j[@"multi"] boolValue];
+                            if ([j[@"left"] isKindOfClass:[NSNumber class]])
+                                leftSec = [j[@"left"] doubleValue];
                         }
                     }
                     if (!isMulti && ([q containsString:@"多选"] ||
@@ -1633,8 +1708,16 @@ static void tryWebViewQuiz(void) {
                     aaLog(@"[H5] 选项：%@ → 开始问 AI", opts);
 
                     double tmo = [cfg[@"timeout"] respondsToSelector:@selector(doubleValue)]
-                               ? [cfg[@"timeout"] doubleValue] : 2.0;
-                    if (tmo <= 0) tmo = 2.0;   // 手机网络上 1.5s 几乎必超时
+                               ? [cfg[@"timeout"] doubleValue] : 6.0;
+                    if (tmo < 4.0) tmo = 4.0;   // 晚高峰实测：免费接口 6.9~26s、glm-4.6 也要 2.6~4.7s，2s 必挂
+                    // 动态预算：按页面剩余秒数收紧（留 3s 给点选+提交），但最少 2.5s
+                    double budget = tmo;
+                    if (leftSec >= 5.0) {
+                        double dyn = leftSec - 3.0;
+                        if (dyn < budget) budget = dyn;
+                        if (budget < 2.5) budget = 2.5;
+                    }
+                    aaLog(@"[H5] AI 预算 %.1fs（配置上限 %.1fs，页面剩余 %.0fs）", budget, tmo, leftSec);
                     __block BOOL done = NO;
                     void (^finish)(NSString *) = ^(NSString *ans){
                         if (done) return;
@@ -1653,12 +1736,12 @@ static void tryWebViewQuiz(void) {
                             answerAndSubmit(wv, nil, q);
                         }
                     };
-                    askAI(q, opts, cfg, isMulti, ^(NSString *ans){ finish(ans); });
-                    // 超时兜底：AI 没按时回就立刻随机点，保证不空过
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(tmo * NSEC_PER_SEC)),
+                    askAIDual(q, opts, cfg, isMulti, budget, ^(NSString *ans){ finish(ans); });
+                    // 绝对兜底：双模型都没按时回才随机（预算已按剩余时间收紧过）
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(budget * NSEC_PER_SEC + 0.3 * NSEC_PER_SEC)),
                                    dispatch_get_main_queue(), ^{
                         if (done) return;
-                        aaLog(@"[AI] %.1fs 超时 → 随机兜底", tmo);
+                        aaLog(@"[AI] %.1fs 总超时 → 随机兜底", budget);
                         finish(nil);
                     });
                 });
