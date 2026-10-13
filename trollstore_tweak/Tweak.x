@@ -1028,6 +1028,8 @@ static NSString *aaStateJS(void) {
     "})()";
 }
 
+static BOOL aaResultShown(NSString *t);   // 前置声明
+
 // ---- 先点选项，隔一会等页面状态刷新，再点提交；复查，没提交出去就换方式重试 ----
 static void answerAndSubmit(WKWebView *wv, NSString *answer, NSString *qkey) {
     // 多个答案时 JS 里是 setTimeout(i*180) 逐个点的，提交要等最后一个点完
@@ -1305,7 +1307,7 @@ static void tick(void) {
                     wr.HTTPMethod = @"HEAD";
                     wr.timeoutInterval = 6.0;
                     [[[NSURLSession sharedSession] dataTaskWithRequest:wr
-                                                     completionHandler:nil] resume];
+        completionHandler:^(NSData *d2, NSURLResponse *r2, NSError *e2){}] resume];
                 }
             }
         }
