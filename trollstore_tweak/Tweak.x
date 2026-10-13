@@ -510,6 +510,17 @@ static NSDictionary *loadAIConfig(void) {
         } @catch (NSException *e) {}
         aaLog(@"[配置] 模型名 %@ 已过时/为空 → 已自动改为 %@ 并写回配置文件", old, nm);
     }
+    // 超时太短在手机网络上几乎必超时（实测 1.5s 不够），低于 2.0 统一抬到 2.0 并写回
+    double tv = [m[@"timeout"] respondsToSelector:@selector(doubleValue)] ? [m[@"timeout"] doubleValue] : 0;
+    if (tv < 2.0) {
+        m[@"timeout"] = @2.0;
+        @try {
+            NSData *td = [NSJSONSerialization dataWithJSONObject:m
+                                                         options:NSJSONWritingPrettyPrinted error:nil];
+            if (td) [td writeToFile:aaConfigPath() atomically:YES];
+        } @catch (NSException *e) {}
+        aaLog(@"[配置] 超时 %.1fs 太短（手机网络实测不够）→ 已自动改为 2.0s", tv);
+    }
     return m;
 }
 static void ensureConfigFile(void) {
@@ -786,8 +797,8 @@ static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg, BOOL isM
         req.HTTPBody = bd;
 
         double tmo = [cfg[@"timeout"] respondsToSelector:@selector(doubleValue)]
-                   ? [cfg[@"timeout"] doubleValue] : 1.5;
-        if (tmo <= 0) tmo = 1.5;
+                   ? [cfg[@"timeout"] doubleValue] : 2.0;
+        if (tmo <= 0) tmo = 2.0;   // 手机网络上 1.5s 几乎必超时
         req.timeoutInterval = tmo + 1.0;
 
         NSURLSession *s = [NSURLSession sharedSession];
@@ -1022,7 +1033,7 @@ static void answerAndSubmit(WKWebView *wv, NSString *answer, NSString *qkey) {
     // 多个答案时 JS 里是 setTimeout(i*180) 逐个点的，提交要等最后一个点完
     NSUInteger nAns = 1;
     if (answer.length) nAns = [[answer componentsSeparatedByString:@"|"] count];
-    double wait = 0.45 + 0.20 * (double)((nAns > 1) ? (nAns - 1) : 0);
+    double wait = 0.35 + 0.20 * (double)((nAns > 1) ? (nAns - 1) : 0);
     webViewRunJS(wv, aaQuizJS(YES, answer), ^(NSString *r){
         aaLog(@"[H5] 选项点击结果：%@", r ? r : @"无返回");
         // 一个选项都没点上就别提交了：空提交必定答错，还不如不动
@@ -1047,6 +1058,10 @@ static void answerAndSubmit(WKWebView *wv, NSString *answer, NSString *qkey) {
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                                    dispatch_get_main_queue(), ^{
                         webViewRunJS(wv, @"document.body.innerText", ^(NSString *t){
+                            if (aaResultShown(t)) {
+                                aaLog(@"[H5] 页面已出结果 → 本次作答生效");
+                                return;
+                            }
                             BOOL still = t && ([t containsString:@"确认提交"] || [t containsString:@"提交答案"]);
                             if (still && qkey.length == 0) still = NO;                        // 没题干就不乱点
                             if (still && qkey.length && ![t containsString:qkey]) still = NO;  // 已换题别乱点
@@ -1059,6 +1074,10 @@ static void answerAndSubmit(WKWebView *wv, NSString *answer, NSString *qkey) {
                                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                                                dispatch_get_main_queue(), ^{
                                     webViewRunJS(wv, @"document.body.innerText", ^(NSString *t2){
+                                        if (aaResultShown(t2)) {
+                                            aaLog(@"[H5] 页面已出结果 → 本次作答生效");
+                                            return;
+                                        }
                                         BOOL s2 = t2 && ([t2 containsString:@"确认提交"] || [t2 containsString:@"提交答案"]);
                                         if (s2 && qkey.length && ![t2 containsString:qkey]) s2 = NO;
                                         if (!s2) { aaLog(@"[H5] 已离开本题 → 提交成功(mode1)"); return; }
@@ -1075,6 +1094,16 @@ static void answerAndSubmit(WKWebView *wv, NSString *answer, NSString *qkey) {
             });
         });
     });
+}
+
+// 页面出现这些字样 = 本次作答已生效（结果态），不需要再点提交
+static BOOL aaResultShown(NSString *t) {
+    if (t.length == 0) return NO;
+    for (NSString *k in @[@"回答正确", @"回答错误", @"红包已抢完", @"来晚一步",
+                          @"下次早来", @"本轮已结束", @"答题超时"]) {
+        if ([t containsString:k]) return YES;
+    }
+    return NO;
 }
 
 static NSString *gLastWebQ = nil;   // 最近已答过的 H5 题干，用于判重
@@ -1191,8 +1220,8 @@ static void tryWebViewQuiz(void) {
                     aaLog(@"[H5] 选项：%@ → 开始问 AI", opts);
 
                     double tmo = [cfg[@"timeout"] respondsToSelector:@selector(doubleValue)]
-                               ? [cfg[@"timeout"] doubleValue] : 1.5;
-                    if (tmo <= 0) tmo = 1.5;
+                               ? [cfg[@"timeout"] doubleValue] : 2.0;
+                    if (tmo <= 0) tmo = 2.0;   // 手机网络上 1.5s 几乎必超时
                     __block BOOL done = NO;
                     void (^finish)(NSString *) = ^(NSString *ans){
                         if (done) return;
@@ -1259,6 +1288,28 @@ static void tick(void) {
     }
     if (gWorking) return;
     @try {
+
+    // 连接预热：开着插件时每 18s 摸一次 AI 服务器，把 DNS+TLS 焐热。
+    // 否则真到答题时现建连接要多花 300~800ms —— 手机网络上这点非常明显。
+    {
+        static NSDate *gLastWarm = nil;
+        NSDate *nowW = [NSDate date];
+        if (!gLastWarm || [nowW timeIntervalSinceDate:gLastWarm] >= 18.0) {
+            gLastWarm = nowW;
+            NSDictionary *wcfg = loadAIConfig();
+            NSString *wapi = [wcfg[@"api"] isKindOfClass:[NSString class]] ? wcfg[@"api"] : @"";
+            if (wapi.length) {
+                NSURL *wu = [NSURL URLWithString:wapi];
+                if (wu) {
+                    NSMutableURLRequest *wr = [NSMutableURLRequest requestWithURL:wu];
+                    wr.HTTPMethod = @"HEAD";
+                    wr.timeoutInterval = 6.0;
+                    [[[NSURLSession sharedSession] dataTaskWithRequest:wr
+                                                     completionHandler:nil] resume];
+                }
+            }
+        }
+    }
 
     reloadBankIfNeeded();
 
