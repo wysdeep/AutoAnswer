@@ -55,6 +55,8 @@ static NSMutableSet *gDoneQ = nil;
 static NSString *gLastKey = nil;
 static UIWindow *gOverlay = nil;
 static UIButton *gToggleBtn = nil;
+static UIWindow *gCfgWin = nil;      // 内置设置面板窗口
+static UIWindow *gPrevKeyWin = nil;  // 打开面板前的主窗口，关闭后还回去
 
 static NSString *gExternalPath = nil;
 static NSString *gBundledPath = nil;
@@ -82,6 +84,10 @@ static void aaLog(NSString *fmt, ...) {
 }
 
 static void updateToggleUI(void);
+static void openConfigPanel(void);
+static void closeConfigPanel(void);
+static NSDictionary *loadAIConfig(void);
+static NSArray<NSString *> *aaKeysFromConfig(NSDictionary *cfg);
 
 // ---------------- 悬浮开关按钮 ----------------
 @interface AutoAnswerBundle : NSObject @end
@@ -90,6 +96,21 @@ static void updateToggleUI(void);
     gEnabled = !gEnabled;
     updateToggleUI();
     aaLog(@"手动开关 → %@", gEnabled ? @"开" : @"关");
+    // 打开开关却发现还没填 Key → 直接弹设置面板，填完插件自己写进本机配置文件
+    if (gEnabled) {
+        NSDictionary *cfg = loadAIConfig();
+        if (aaKeysFromConfig(cfg).count == 0) {
+            aaLog(@"尚未配置 AI Key → 自动打开设置面板（选平台 → 粘 Key → 保存，插件自己写文件）");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ openConfigPanel(); });
+        }
+    }
+}
++ (void)longPressed:(UILongPressGestureRecognizer *)g {
+    if (g.state == UIGestureRecognizerStateBegan) {
+        aaLog(@"长按悬浮球 → 打开设置面板");
+        openConfigPanel();
+    }
 }
 @end
 
@@ -122,6 +143,11 @@ static void createOverlay(UIWindowScene *scene) {
     [b addTarget:[AutoAnswerBundle class]
           action:@selector(toggleTapped)
 forControlEvents:UIControlEventTouchUpInside];
+    UILongPressGestureRecognizer *lp =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:[AutoAnswerBundle class]
+                                                      action:@selector(longPressed:)];
+    lp.minimumPressDuration = 0.6;   // 长按 0.6s 打开设置面板（短按仍然是开/关）
+    [b addGestureRecognizer:lp];
     [w addSubview:b];
 
     gOverlay = w;
@@ -526,14 +552,376 @@ static NSDictionary *loadAIConfig(void) {
 static void ensureConfigFile(void) {
     NSString *p = aaConfigPath();
     if ([[NSFileManager defaultManager] fileExistsAtPath:p]) return;
-    NSDictionary *def = @{@"api":    @"https://api.deepseek.com/chat/completions",
+    // 默认给智谱免费档：注册就有免费额度，不需要充值
+    NSDictionary *def = @{@"api":    @"https://open.bigmodel.cn/api/paas/v4/chat/completions",
                           @"key":    @"",
-                          @"model":  @"deepseek-flash",
-                          @"timeout": @1.5};
+                          @"model":  @"glm-4.5-flash",
+                          @"timeout": @2.0};
     NSData *d = [NSJSONSerialization dataWithJSONObject:def
                                                 options:NSJSONWritingPrettyPrinted error:nil];
     if (d && [d writeToFile:p atomically:YES])
-        aaLog(@"已生成 AI 配置文件（用 Filza 填入 key 后重启淘宝生效）：%@", p);
+        aaLog(@"已生成 AI 配置文件（不用手动改：长按悬浮球 → 设置面板里粘贴 Key 即可）：%@", p);
+}
+
+// ================= 内置设置面板：长按悬浮球打开，直接填 Key，插件自己写配置文件 =================
+// 换手机 / 多机部署时不用再拿 Filza 改 AutoAnswer_config.json，每台手机各填各的 Key。
+// 支持一次填多个 Key（逗号/分号/空格/换行分隔）→ 存成 keys 数组，每次随机挑一个，
+// 被限流(429)且失败很快时自动换下一个再试一次。
+
+static NSArray<NSDictionary *> *aaPresets(void) {
+    return @[
+        @{@"name": @"智谱·免费",  @"api": @"https://open.bigmodel.cn/api/paas/v4/chat/completions",
+          @"model": @"glm-4.5-flash"},
+        @{@"name": @"DeepSeek",   @"api": @"https://api.deepseek.com/chat/completions",
+          @"model": @"deepseek-flash"},
+        @{@"name": @"硅基流动",   @"api": @"https://api.siliconflow.cn/v1/chat/completions",
+          @"model": @"Qwen/Qwen2.5-7B-Instruct"},
+        @{@"name": @"魔搭·免费",  @"api": @"https://api-inference.modelscope.cn/v1/chat/completions",
+          @"model": @"Qwen/Qwen2.5-7B-Instruct"},
+    ];
+}
+
+// 从配置里取出所有可用 Key（兼容单 key 字段和 keys 数组；单字段里也能塞多个）
+static NSArray<NSString *> *aaKeysFromConfig(NSDictionary *cfg) {
+    NSMutableArray *out = [NSMutableArray array];
+    if (![cfg isKindOfClass:[NSDictionary class]]) return out;
+    id ks = cfg[@"keys"];
+    if ([ks isKindOfClass:[NSArray class]]) {
+        for (id k in (NSArray *)ks)
+            if ([k isKindOfClass:[NSString class]] && [k length] && ![out containsObject:k])
+                [out addObject:k];
+    }
+    NSString *k1 = [cfg[@"key"] isKindOfClass:[NSString class]] ? cfg[@"key"] : @"";
+    if (k1.length) {
+        NSCharacterSet *sep =
+            [NSCharacterSet characterSetWithCharactersInString:@",，;； \t\r\n|"];
+        for (NSString *p in [k1 componentsSeparatedByCharactersInSet:sep]) {
+            NSString *t = [p stringByTrimmingCharactersInSet:
+                              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (t.length && ![out containsObject:t]) [out addObject:t];
+        }
+    }
+    return out;
+}
+
+// 测试一个 Key 通不通（只发一句「只回复两个字：正常」，几乎不花钱）
+static void aaTestConnection(NSString *api, NSString *model, NSString *key,
+                             void (^cb)(BOOL ok, NSString *msg)) {
+    @try {
+        if (api.length == 0 || key.length == 0) { if (cb) cb(NO, @"❌ 还没填 Key"); return; }
+        if (model.length == 0) model = @"glm-4.5-flash";
+        NSMutableDictionary *body = [@{@"model": model,
+                                       @"messages": @[@{@"role": @"user",
+                                                        @"content": @"只回复两个字：正常"}],
+                                       @"max_tokens": @16,
+                                       @"temperature": @0} mutableCopy];
+        if ([api containsString:@"deepseek"] || [api containsString:@"bigmodel"])
+            body[@"thinking"] = @{@"type": @"disabled"};
+        NSData *bd = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+        if (!bd) { if (cb) cb(NO, @"❌ 请求组装失败"); return; }
+
+        NSMutableURLRequest *req =
+            [NSMutableURLRequest requestWithURL:[NSURL URLWithString:api]];
+        req.HTTPMethod = @"POST";
+        [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        [req setValue:[NSString stringWithFormat:@"Bearer %@", key]
+                      forHTTPHeaderField:@"Authorization"];
+        req.HTTPBody = bd;
+        req.timeoutInterval = 15.0;
+
+        NSDate *t0 = [NSDate date];
+        [[[NSURLSession sharedSession] dataTaskWithRequest:req
+            completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+            NSInteger code = 0; NSString *ans = nil; NSString *raw = @"";
+            @try {
+                if ([r isKindOfClass:[NSHTTPURLResponse class]])
+                    code = ((NSHTTPURLResponse *)r).statusCode;
+                if (d) {
+                    raw = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
+                    id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+                    if ([j isKindOfClass:[NSDictionary class]]) {
+                        id ch = j[@"choices"];
+                        if ([ch isKindOfClass:[NSArray class]] && [ch count] > 0) {
+                            id msg = ch[0][@"message"];
+                            if ([msg isKindOfClass:[NSDictionary class]]) {
+                                if ([msg[@"content"] isKindOfClass:[NSString class]] &&
+                                    [msg[@"content"] length]) ans = msg[@"content"];
+                                else if ([msg[@"reasoning_content"] isKindOfClass:[NSString class]] &&
+                                         [msg[@"reasoning_content"] length])
+                                    ans = msg[@"reasoning_content"];
+                            }
+                        }
+                    }
+                }
+            } @catch (NSException *ex) { ans = nil; }
+            if (ans) ans = [ans stringByTrimmingCharactersInSet:
+                                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            double cost = [[NSDate date] timeIntervalSinceDate:t0];
+            NSString *tail = raw.length > 120 ? [raw substringToIndex:120] : raw;
+            NSString *m; BOOL ok = NO;
+            if (ans.length)      { ok = YES; m = [NSString stringWithFormat:
+                                    @"✅ 通了！耗时 %.2fs，模型回：%@", cost, ans]; }
+            else if (code == 401 || code == 403)
+                m = @"❌ Key 不对或没权限(401/403)，重新复制一遍";
+            else if (code == 429)
+                m = @"❌ 被限流(429)：这个 Key 正被别处占用，换一个";
+            else if (code == 402)
+                m = @"❌ 余额不足(402)，换免费平台";
+            else if (code >= 400)
+                m = [NSString stringWithFormat:@"❌ HTTP=%ld %@", (long)code, tail];
+            else
+                m = [NSString stringWithFormat:@"❌ 网络失败：%@ %@",
+                     e ? [e localizedDescription] : @"", tail];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                aaLog(@"[测试] %@（%@ / %@）", m, api, model);
+                if (cb) cb(ok, m);
+            });
+        }] resume];
+    } @catch (NSException *e) {
+        if (cb) cb(NO, @"❌ 测试异常");
+    }
+}
+
+@interface AACfgVC : UIViewController <UITextFieldDelegate>
+@property (nonatomic, strong) UITextField *keyF;
+@property (nonatomic, strong) UILabel *infoL;
+@property (nonatomic, strong) NSMutableArray *pBtns;
+@property (nonatomic, strong) NSString *api;
+@property (nonatomic, strong) NSString *model;
+@end
+
+@implementation AACfgVC
+
+- (UIButton *)mkBtn:(NSString *)t frame:(CGRect)f bg:(UIColor *)bg sel:(SEL)s {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = f;
+    [b setTitle:t forState:UIControlStateNormal];
+    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    b.backgroundColor = bg;
+    b.layer.cornerRadius = 8;
+    b.layer.masksToBounds = YES;
+    [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    @try {
+    CGRect b = self.view.bounds;
+    CGFloat W = b.size.width;
+
+    UIView *dim = [[UIView alloc] initWithFrame:b];
+    dim.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
+    UITapGestureRecognizer *tp =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(bgTapped)];
+    [dim addGestureRecognizer:tp];
+    [self.view addSubview:dim];
+
+    CGFloat CW = W - 28, CH = 402, CX = 14;
+    CGFloat CY = MAX(30, (b.size.height - CH) / 2 - 50);
+    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(CX, CY, CW, CH)];
+    card.backgroundColor = [UIColor colorWithRed:0.12 green:0.13 blue:0.15 alpha:1.0];
+    card.layer.cornerRadius = 14;
+    card.layer.masksToBounds = YES;
+    [self.view addSubview:card];
+
+    UILabel *ttl = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, CW - 32, 26)];
+    ttl.text = @"自动答题 · AI 设置";
+    ttl.textColor = UIColor.whiteColor;
+    ttl.font = [UIFont boldSystemFontOfSize:18];
+    [card addSubview:ttl];
+
+    UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(16, 38, CW - 32, 36)];
+    sub.numberOfLines = 2;
+    sub.text = @"选平台 → 粘 Key → 点「测试连接」→ 保存。\n保存即写入本机配置文件，重启淘宝也在。";
+    sub.textColor = [UIColor colorWithWhite:0.72 alpha:1];
+    sub.font = [UIFont systemFontOfSize:12];
+    [card addSubview:sub];
+
+    NSArray<NSDictionary *> *ps = aaPresets();
+    self.pBtns = [NSMutableArray array];
+    CGFloat pw = (CW - 32 - 10) / 2;
+    for (NSUInteger i = 0; i < ps.count; i++) {
+        UIButton *pb = [self mkBtn:ps[i][@"name"]
+                             frame:CGRectMake(16 + (i % 2) * (pw + 10), 82 + (i / 2) * 42, pw, 34)
+                                bg:[UIColor colorWithWhite:0.30 alpha:1]
+                               sel:@selector(preset:)];
+        pb.tag = (NSInteger)i;
+        [card addSubview:pb];
+        [self.pBtns addObject:pb];
+    }
+
+    UITextField *kf = [[UITextField alloc] initWithFrame:CGRectMake(16, 174, CW - 32, 42)];
+    kf.placeholder = @"粘贴 API Key（多个用逗号或换行分隔，会自动轮换）";
+    kf.borderStyle = UITextBorderStyleRoundedRect;
+    kf.font = [UIFont systemFontOfSize:13];
+    kf.backgroundColor = [UIColor colorWithWhite:1 alpha:0.94];
+    kf.autocorrectionType = UITextAutocorrectionTypeNo;
+    kf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    kf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    kf.returnKeyType = UIReturnKeyDone;
+    kf.delegate = self;
+    [kf addTarget:self action:@selector(keyChanged)
+                  forControlEvents:UIControlEventEditingChanged];
+    [card addSubview:kf];
+    self.keyF = kf;
+
+    UILabel *info = [[UILabel alloc] initWithFrame:CGRectMake(16, 224, CW - 32, 66)];
+    info.numberOfLines = 4;
+    info.font = [UIFont systemFontOfSize:12];
+    info.textColor = [UIColor colorWithWhite:0.86 alpha:1];
+    [card addSubview:info];
+    self.infoL = info;
+
+    CGFloat bw = (CW - 32 - 10) / 2;
+    [card addSubview:[self mkBtn:@"测试连接"
+                           frame:CGRectMake(16, 298, bw, 40)
+                              bg:[UIColor colorWithRed:0.20 green:0.45 blue:0.75 alpha:1]
+                             sel:@selector(testTapped)]];
+    [card addSubview:[self mkBtn:@"取消"
+                           frame:CGRectMake(16 + bw + 10, 298, bw, 40)
+                              bg:[UIColor colorWithWhite:0.35 alpha:1]
+                             sel:@selector(cancelTapped)]];
+    [card addSubview:[self mkBtn:@"保存并开启"
+                           frame:CGRectMake(16, 346, CW - 32, 44)
+                              bg:[UIColor colorWithRed:0.15 green:0.62 blue:0.30 alpha:1]
+                             sel:@selector(saveTapped)]];
+
+    NSDictionary *cfg = loadAIConfig();
+    NSString *api   = [cfg[@"api"]   isKindOfClass:[NSString class]] ? cfg[@"api"]   : @"";
+    NSString *model = [cfg[@"model"] isKindOfClass:[NSString class]] ? cfg[@"model"] : @"";
+    NSString *key   = [cfg[@"key"]   isKindOfClass:[NSString class]] ? cfg[@"key"]   : @"";
+    self.api   = api.length   ? api   : ps[0][@"api"];
+    self.model = model.length ? model : ps[0][@"model"];
+    self.keyF.text = key;
+
+    // 选中当前 api 对应的预设按钮
+    NSInteger idx = 0;
+    for (NSUInteger i = 0; i < ps.count; i++)
+        if ([ps[i][@"api"] isEqualToString:self.api]) idx = (NSInteger)i;
+    [self markPreset:idx];
+    [self refreshInfo];
+    } @catch (NSException *e) {
+        aaLog(@"[异常] 设置面板：%@", e);
+    }
+}
+
+- (void)markPreset:(NSInteger)idx {
+    for (UIButton *x in self.pBtns) {
+        BOOL on = (x.tag == idx);
+        x.backgroundColor = on ? [UIColor colorWithRed:0.15 green:0.62 blue:0.30 alpha:1]
+                               : [UIColor colorWithWhite:0.30 alpha:1];
+    }
+}
+
+- (void)refreshInfo {
+    NSArray<NSString *> *ks = aaKeysFromConfig(@{@"key": self.keyF.text ?: @""});
+    NSString *kd;
+    if (ks.count == 0)      kd = @"❌ 未填写（只会随机作答）";
+    else if (ks.count == 1) kd = [NSString stringWithFormat:
+                @"1 个（…%@）", [ks[0] substringFromIndex:(NSUInteger)MAX(0, (int)[ks[0] length] - 6)]];
+    else                    kd = [NSString stringWithFormat:
+                @"%lu 个（自动轮换，被限流会换下一个）", (unsigned long)ks.count];
+    self.infoL.text = [NSString stringWithFormat:
+        @"渠道：%@\n模型：%@\nKey：%@\n超时：2.0s（手机网络实测够用）",
+        self.api, self.model, kd];
+}
+
+- (void)preset:(UIButton *)b {
+    NSDictionary *p = aaPresets()[b.tag];
+    self.api = p[@"api"];
+    self.model = p[@"model"];
+    [self markPreset:b.tag];
+    [self refreshInfo];
+}
+- (void)keyChanged { [self refreshInfo]; }
+- (void)bgTapped   { [self.view endEditing:YES]; }
+- (void)cancelTapped { [self.view endEditing:YES]; closeConfigPanel(); }
+- (BOOL)textFieldShouldReturn:(UITextField *)tf { [tf resignFirstResponder]; return YES; }
+
+- (void)testTapped {
+    NSArray<NSString *> *ks = aaKeysFromConfig(@{@"key": self.keyF.text ?: @""});
+    if (ks.count == 0) { self.infoL.text = @"⚠️ 先粘贴 Key 再测试"; return; }
+    [self.view endEditing:YES];
+    self.infoL.text = @"⏳ 正在测试…（最多 15 秒）";
+    NSString *api = self.api, *mdl = self.model, *k = ks[0];
+    __weak typeof(self) ws = self;
+    aaTestConnection(api, mdl, k, ^(BOOL ok, NSString *msg) {
+        dispatch_async(dispatch_get_main_queue(), ^{ ws.infoL.text = msg; });
+    });
+}
+
+- (void)saveTapped {
+    NSArray<NSString *> *ks = aaKeysFromConfig(@{@"key": self.keyF.text ?: @""});
+    if (ks.count == 0) {
+        self.infoL.text = @"⚠️ 还没填 Key：不填也能用，但只会随机作答（25%）";
+        return;
+    }
+    NSMutableDictionary *cfg = [NSMutableDictionary dictionary];
+    cfg[@"api"]     = self.api;
+    cfg[@"model"]   = self.model;
+    cfg[@"key"]     = ks.firstObject;
+    if (ks.count > 1) cfg[@"keys"] = ks;
+    cfg[@"timeout"] = @2.0;
+    BOOL ok = NO;
+    @try {
+        NSData *d = [NSJSONSerialization dataWithJSONObject:cfg
+                                                    options:NSJSONWritingPrettyPrinted error:nil];
+        ok = (d && [d writeToFile:aaConfigPath() atomically:YES]);
+    } @catch (NSException *e) { ok = NO; }
+    if (!ok) { self.infoL.text = @"❌ 写入失败（磁盘权限？）"; aaLog(@"[设置] 写配置失败"); return; }
+    aaLog(@"[设置] 已保存：%@ / %@ / %lu 个 Key → %@",
+          self.api, self.model, (unsigned long)ks.count, aaConfigPath());
+    gEnabled = YES; updateToggleUI();
+    [self.view endEditing:YES];
+    self.infoL.text = [NSString stringWithFormat:@"✅ 已保存并开启（%lu 个 Key）",
+                       (unsigned long)ks.count];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ closeConfigPanel(); });
+}
+@end
+
+static void openConfigPanel(void) {
+    if (gCfgWin) return;
+    @try {
+        UIWindowScene *sc = nil;
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]] &&
+                ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
+                sc = (UIWindowScene *)s; break;
+            }
+        }
+        if (!sc)
+            for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
+                if ([s isKindOfClass:[UIWindowScene class]]) { sc = (UIWindowScene *)s; break; }
+        if (!sc) return;
+
+        UIWindow *kw = UIApplication.sharedApplication.keyWindow;
+        if (kw != gOverlay) gPrevKeyWin = kw;
+
+        UIWindow *w = [[UIWindow alloc] initWithWindowScene:sc];
+        w.frame = [UIScreen mainScreen].bounds;
+        w.windowLevel = UIWindowLevelAlert + 200;
+        w.backgroundColor = [UIColor clearColor];
+        w.rootViewController = [[AACfgVC alloc] init];
+        w.hidden = NO;
+        [w makeKeyAndVisible];
+        gCfgWin = w;
+    } @catch (NSException *e) {
+        aaLog(@"[异常] openConfigPanel：%@", e);
+    }
+}
+
+static void closeConfigPanel(void) {
+    if (!gCfgWin) return;
+    @try {
+        [gCfgWin endEditing:YES];
+        gCfgWin.hidden = YES;
+        gCfgWin.rootViewController = nil;
+        gCfgWin = nil;
+        if (gPrevKeyWin) { [gPrevKeyWin makeKeyAndVisible]; gPrevKeyWin = nil; }
+    } @catch (NSException *e) {}
 }
 
 // ---- 自学习缓存：AI 答过的题记下来，下次同样的题 0 毫秒命中，不再联网 ----
@@ -759,11 +1147,22 @@ static NSString *aaHeuristicAnswer(NSArray *opts) {
 }
 
 // ---- 联网问答案：返回正确选项的文字；失败/超时返回 nil ----
+// 支持多 Key：每次随机挑一个；若失败得很快（429/401 之类）且还有别的 Key，立刻换一个重试一次。
+static void askAIWithKey(NSString *question, NSArray *opts, NSDictionary *cfg, BOOL isMulti,
+                         NSString *key, int attempt, void (^cb)(NSString *));
+
 static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg, BOOL isMulti,
                   void (^cb)(NSString *)) {
+    NSArray<NSString *> *keys = aaKeysFromConfig(cfg);
+    if (keys.count == 0) { if (cb) cb(nil); return; }
+    NSString *k0 = keys[arc4random_uniform((uint32_t)keys.count)];
+    askAIWithKey(question, opts, cfg, isMulti, k0, 0, cb);
+}
+
+static void askAIWithKey(NSString *question, NSArray *opts, NSDictionary *cfg, BOOL isMulti,
+                         NSString *key, int attempt, void (^cb)(NSString *)) {
     @try {
         NSString *api   = [cfg[@"api"] isKindOfClass:[NSString class]] ? cfg[@"api"] : @"";
-        NSString *key   = [cfg[@"key"] isKindOfClass:[NSString class]] ? cfg[@"key"] : @"";
         // 注意：deepseek-chat / deepseek-reasoner 已于 2026-07-24 退役，必须用 deepseek-flash
         NSString *model = [cfg[@"model"] isKindOfClass:[NSString class]] ? cfg[@"model"] : @"deepseek-flash";
         if (api.length == 0 || key.length == 0) { if (cb) cb(nil); return; }
@@ -846,6 +1245,17 @@ static void askAI(NSString *question, NSArray *opts, NSDictionary *cfg, BOOL isM
                     else if (code == 402)                aaLog(@"[AI] → 余额不足，需要充值或换免费平台");
                     else if (code == 429)                aaLog(@"[AI] → 被限流/免费额度用完，换平台或把 timeout 调大");
                     else if (code >= 400 && code < 500)  aaLog(@"[AI] → 请求被拒，多半是 model 名字不对或该平台没有这个模型");
+                }
+                // 失败得很快（429/401 这种立刻返回的）且有备用 Key → 换一个再试一次
+                if (!ans.length && attempt == 0 && cost < 0.8) {
+                    NSMutableArray *rest = [aaKeysFromConfig(cfg) mutableCopy];
+                    [rest removeObject:key];
+                    if (rest.count > 0) {
+                        NSString *nk = rest[arc4random_uniform((uint32_t)rest.count)];
+                        aaLog(@"[AI] 本 Key 失败且很快（%.2fs）→ 换另一个 Key 重试一次", cost);
+                        askAIWithKey(question, opts, cfg, isMulti, nk, 1, cb);
+                        return;
+                    }
                 }
                 if (cb) cb(ans);
             });
@@ -1214,9 +1624,10 @@ static void tryWebViewQuiz(void) {
                     }
 
                     NSDictionary *cfg = loadAIConfig();
-                    NSString *key = [cfg[@"key"] isKindOfClass:[NSString class]] ? cfg[@"key"] : @"";
-                    if (!cfg || key.length == 0) {
-                        justRandom([NSString stringWithFormat:@"未配置 AI key（配置文件 %@）", aaConfigPath()]);
+                    if (!cfg || aaKeysFromConfig(cfg).count == 0) {
+                        justRandom([NSString stringWithFormat:
+                            @"未配置 AI key（长按悬浮球 → 设置面板里粘贴 Key 即可；配置文件 %@）",
+                            aaConfigPath()]);
                         return;
                     }
                     aaLog(@"[H5] 选项：%@ → 开始问 AI", opts);
@@ -1707,5 +2118,5 @@ static void tick(void) {
     [NSTimer scheduledTimerWithTimeInterval:0.2
                                     repeats:YES
                                       block:^(NSTimer *t){ tick(); }];
-    aaLog(@"插件已加载（题面规则作答：以上都对直接选 / 哪N多选 / 数字+个种项多选 / 数字3和4 / 一长三短选最长 / 无数字随机）\n默认关闭（点悬浮球开启）");
+    aaLog(@"插件已加载（题面规则作答：以上都对直接选 / 哪N多选 / 数字+个种项多选 / 数字3和4 / 一长三短选最长 / 无数字随机）\n默认关闭（点悬浮球开启）\n长按悬浮球 0.6 秒 → 打开设置面板，可直接粘贴 AI Key（插件自己写入本机配置文件）");
 }
