@@ -1792,7 +1792,8 @@ static void tryWebViewQuiz(void) {
                         done = YES;
                         if (ans.length) {
                             // AI 可能一次给多个答案（空格或 | 分隔），拆开再用 | 拼给 JS
-                            NSMutableArray *parts = [[aaSplitAnswers(ans, opts) mutableCopy] ?: [NSMutableArray array]];
+                            NSMutableArray *parts =
+                                [NSMutableArray arrayWithArray:aaSplitAnswers(ans, opts)];
                             // 多选数量校准：题干要 N 个 → AI 给多了砍到 N，给少了从没选中的随机补到 N
                             if (isMulti && parts.count > 0) {
                                 int want = aaMultiCount(q);
