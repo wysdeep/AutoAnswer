@@ -924,12 +924,22 @@ static NSString *aaQuizJS(BOOL doClick, NSString *answer) {
         "  if(hits.indexOf(o)>=0)return;"
         "  if(o.t===w||o.t.indexOf(w)===0||w.indexOf(o.t)===0)hits.push(o);});});"
         "if(!hits.length&&opts.length)hits=[opts[Math.floor(Math.random()*opts.length)]];"
+        "function deep(el){"
+        " try{fire(el);}catch(_){}"
+        " try{var r=el.getBoundingClientRect();"
+        "  var top=document.elementFromPoint(Math.round(r.left+r.width/2),Math.round(r.top+r.height/2));"
+        "  if(top&&top!==el&&!(el.contains&&el.contains(top)))fire(top);}catch(_){}"
+        "}"
         "var clicked=[];"
         "hits.forEach(function(h,i){"
-        " var go=function(){try{fire(h.e);clicked.push(h.t);}catch(_){}};"
+        " var go=function(){try{deep(h.e);clicked.push(h.t);}catch(_){}};"
         " if(i===0)go();else setTimeout(go,i*180);});"
+        "var sel=[];"
+        "try{opts.forEach(function(o){var c=o.e.className||'';"
+        " if(typeof c!=='string')c=String(c);"
+        " if(/select|active|checked|chosen|picked|cur|on\\b|highlight/i.test(c))sel.push(o.t);});}catch(_){}"
         "return JSON.stringify({q:qt,opts:names,want:want,multi:multi,"
-        " n:hits.length,clicked:clicked});})()", safe];
+        " n:hits.length,clicked:clicked,sel:sel});})()", safe];
     return [head stringByAppendingString:tail];
 }
 
@@ -949,9 +959,12 @@ static NSString *aaSubmitJS(int mode) {
     " if(tg==='BUTTON'||tg==='A'){btn=cand[i];break;}}"
     "if(!btn)btn=cand[cand.length-1];"
     "var el=btn,up=0;"
-    "if(%d===1){var p=btn.parentElement;"
-    " while(p&&p!==document.body&&up<4&&(p.innerText||'').trim().length>40)p=p.parentElement,up++;"
-    " if(p)el=p;}"
+    "if(%d===1){var p=btn.parentElement,ok=null;"
+    " while(p&&p!==document.body&&up<3){var pt=(p.innerText||'').trim();"
+    "  if(pt.length<=40){ok=p;break;}"
+    "  p=p.parentElement;up++;}"
+    " if(!ok){return JSON.stringify({err:'parent-too-big',mode:%d});}"
+    " el=ok;}"
     "if(%d===2){var r0=btn.getBoundingClientRect();"
     " var hit=document.elementFromPoint(Math.round(r0.left+r0.width/2),Math.round(r0.top+r0.height/2));"
     " if(hit)el=hit;}"
@@ -983,10 +996,28 @@ static NSString *aaSubmitJS(int mode) {
     "var ok='no';try{el.click();ok='clicked';}catch(_){ok='err';}"
     "return JSON.stringify({submit:ok,text:(txt(el)||'').slice(0,20),tag:(el.tagName||''),"
     " wasDisabled:wasDisabled,stillDisabled:!!el.disabled,x:cx,y:cy,up:up,mode:%d});"
-    "})()", mode, mode, mode, mode];
+    "})()", mode, mode, mode, mode, mode];
 }
 
-// ---- 先点选项，隔 0.35s 等页面状态刷新，再点提交；0.8s 后复查，没提交出去就改点外层容器重试 ----
+// ---- 提交前探一下状态：选项有没有真的被选中、提交按钮是不是禁用（排查利器）----
+static NSString *aaStateJS(void) {
+    return @"(function(){"
+    "function txt(e){return (e.innerText||e.textContent||'').trim();}"
+    "var all=[].slice.call(document.querySelectorAll('*'));"
+    "var btn=null,dis=null;"
+    "all.forEach(function(e){if(btn)return;var t=txt(e);"
+    " if(t&&t.length<=12&&/^(确认提交|提交答案|提交|确认)$/.test(t))btn=e;});"
+    "if(btn){try{dis=!!btn.disabled;}catch(_){dis=null;}}"
+    "var sel=[];"
+    "all.forEach(function(e){var c=e.className||'';"
+    " if(typeof c!=='string')c=String(c);"
+    " if(/select|active|checked|chosen|picked|highlight/i.test(c)){"
+    "  var t=txt(e);if(t&&t.length<=30)sel.push(t);}});"
+    "return JSON.stringify({btn:btn?txt(btn):'',disabled:dis,sel:sel.slice(0,8)});"
+    "})()";
+}
+
+// ---- 先点选项，隔一会等页面状态刷新，再点提交；复查，没提交出去就换方式重试 ----
 static void answerAndSubmit(WKWebView *wv, NSString *answer, NSString *qkey) {
     // 多个答案时 JS 里是 setTimeout(i*180) 逐个点的，提交要等最后一个点完
     NSUInteger nAns = 1;
@@ -1008,28 +1039,33 @@ static void answerAndSubmit(WKWebView *wv, NSString *answer, NSString *qkey) {
         }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            webViewRunJS(wv, aaSubmitJS(0), ^(NSString *r2){
-                aaLog(@"[H5] 提交结果(mode0)：%@", r2 ? r2 : @"无返回");
-                // 0.8s 后复查：还在本题就逐级重试 —— 外层容器 → 坐标处最顶层元素
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    webViewRunJS(wv, @"document.body.innerText", ^(NSString *t){
-                        BOOL still = t && ([t containsString:@"确认提交"] || [t containsString:@"提交答案"]);
-                        if (still && qkey.length == 0) still = NO;                        // 没题干就不乱点
-                        if (still && qkey.length && ![t containsString:qkey]) still = NO;  // 已换题别乱点
-                        if (!still) { aaLog(@"[H5] 已离开本题 → 提交成功"); return; }
-                        aaLog(@"[H5] 提交后仍在本题 → 重试 mode1（外层容器）");
-                        webViewRunJS(wv, aaSubmitJS(1), ^(NSString *r3){
-                            aaLog(@"[H5] 提交结果(mode1)：%@", r3 ? r3 : @"无返回");
-                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                                           dispatch_get_main_queue(), ^{
-                                webViewRunJS(wv, @"document.body.innerText", ^(NSString *t2){
-                                    BOOL s2 = t2 && ([t2 containsString:@"确认提交"] || [t2 containsString:@"提交答案"]);
-                                    if (s2 && qkey.length && ![t2 containsString:qkey]) s2 = NO;
-                                    if (!s2) { aaLog(@"[H5] 已离开本题 → 提交成功(mode1)"); return; }
-                                    aaLog(@"[H5] 仍在本题 → 最后重试 mode2（坐标顶层元素）");
-                                    webViewRunJS(wv, aaSubmitJS(2), ^(NSString *r4){
-                                        aaLog(@"[H5] 提交结果(mode2)：%@", r4 ? r4 : @"无返回");
+            // 提交前先探状态：选项到底选中了没、按钮禁用没 —— 排查用，很有价值
+            webViewRunJS(wv, aaStateJS(), ^(NSString *st){
+                aaLog(@"[H5] 提交前状态：%@", st ? st : @"无返回");
+                webViewRunJS(wv, aaSubmitJS(0), ^(NSString *r2){
+                    aaLog(@"[H5] 提交结果(mode0)：%@", r2 ? r2 : @"无返回");
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        webViewRunJS(wv, @"document.body.innerText", ^(NSString *t){
+                            BOOL still = t && ([t containsString:@"确认提交"] || [t containsString:@"提交答案"]);
+                            if (still && qkey.length == 0) still = NO;                        // 没题干就不乱点
+                            if (still && qkey.length && ![t containsString:qkey]) still = NO;  // 已换题别乱点
+                            if (!still) { aaLog(@"[H5] 已离开本题 → 提交成功"); return; }
+                            aaLog(@"[H5] 复查正文(前 120 字)：%@",
+                                  t.length > 120 ? [t substringToIndex:120] : t);
+                            aaLog(@"[H5] 提交后仍在本题 → 重试 mode1（外层容器）");
+                            webViewRunJS(wv, aaSubmitJS(1), ^(NSString *r3){
+                                aaLog(@"[H5] 提交结果(mode1)：%@", r3 ? r3 : @"无返回");
+                                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                                               dispatch_get_main_queue(), ^{
+                                    webViewRunJS(wv, @"document.body.innerText", ^(NSString *t2){
+                                        BOOL s2 = t2 && ([t2 containsString:@"确认提交"] || [t2 containsString:@"提交答案"]);
+                                        if (s2 && qkey.length && ![t2 containsString:qkey]) s2 = NO;
+                                        if (!s2) { aaLog(@"[H5] 已离开本题 → 提交成功(mode1)"); return; }
+                                        aaLog(@"[H5] 仍在本题 → 最后重试 mode2（坐标顶层元素）");
+                                        webViewRunJS(wv, aaSubmitJS(2), ^(NSString *r4){
+                                            aaLog(@"[H5] 提交结果(mode2)：%@", r4 ? r4 : @"无返回");
+                                        });
                                     });
                                 });
                             });
