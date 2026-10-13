@@ -551,6 +551,12 @@ static NSDictionary *loadAIConfig(void) {
             wr = YES;
             aaLog(@"[配置] 备用模型设为 glm-4.5-air（实测 0.5s，主模型没赶上时用它兜底）");
         }
+        NSString *m3 = [m[@"model3"] isKindOfClass:[NSString class]] ? m[@"model3"] : @"";
+        if (m3.length == 0) {
+            m[@"model3"] = @"glm-4.5-flash";
+            wr = YES;
+            aaLog(@"[配置] 第三级兜底设为 glm-4.5-flash（免费，前两级都 402 时它还能试一把）");
+        }
         if (wr) {
             @try {
                 NSData *nd = [NSJSONSerialization dataWithJSONObject:m
@@ -581,6 +587,7 @@ static void ensureConfigFile(void) {
                           @"key":     @"",
                           @"model":   @"glm-4.6",
                           @"model2":  @"glm-4.5-air",
+                          @"model3":  @"glm-4.5-flash",
                           @"timeout": @6.0};
     NSData *d = [NSJSONSerialization dataWithJSONObject:def
                                                 options:NSJSONWritingPrettyPrinted error:nil];
@@ -596,13 +603,13 @@ static void ensureConfigFile(void) {
 static NSArray<NSDictionary *> *aaPresets(void) {
     return @[
         @{@"name": @"智谱",       @"api": @"https://open.bigmodel.cn/api/paas/v4/chat/completions",
-          @"model": @"glm-4.6",  @"model2": @"glm-4.5-air"},
+          @"model": @"glm-4.6",  @"model2": @"glm-4.5-air", @"model3": @"glm-4.5-flash"},
         @{@"name": @"DeepSeek",   @"api": @"https://api.deepseek.com/chat/completions",
-          @"model": @"deepseek-flash", @"model2": @""},
+          @"model": @"deepseek-flash", @"model2": @"", @"model3": @""},
         @{@"name": @"硅基流动",   @"api": @"https://api.siliconflow.cn/v1/chat/completions",
-          @"model": @"Qwen/Qwen2.5-7B-Instruct", @"model2": @""},
+          @"model": @"Qwen/Qwen2.5-7B-Instruct", @"model2": @"", @"model3": @""},
         @{@"name": @"魔搭",       @"api": @"https://api-inference.modelscope.cn/v1/chat/completions",
-          @"model": @"Qwen/Qwen2.5-7B-Instruct", @"model2": @""},
+          @"model": @"Qwen/Qwen2.5-7B-Instruct", @"model2": @"", @"model3": @""},
     ];
 }
 
@@ -714,6 +721,7 @@ static void aaTestConnection(NSString *api, NSString *model, NSString *key,
 @property (nonatomic, strong) NSString *api;
 @property (nonatomic, strong) NSString *model;
 @property (nonatomic, strong) NSString *model2;
+@property (nonatomic, strong) NSString *model3;
 @end
 
 @implementation AACfgVC
@@ -818,10 +826,12 @@ static void aaTestConnection(NSString *api, NSString *model, NSString *key,
     NSString *api   = [cfg[@"api"]    isKindOfClass:[NSString class]] ? cfg[@"api"]    : @"";
     NSString *model = [cfg[@"model"]  isKindOfClass:[NSString class]] ? cfg[@"model"]  : @"";
     NSString *mod2  = [cfg[@"model2"] isKindOfClass:[NSString class]] ? cfg[@"model2"] : @"";
+    NSString *mod3  = [cfg[@"model3"] isKindOfClass:[NSString class]] ? cfg[@"model3"] : @"";
     NSString *key   = [cfg[@"key"]    isKindOfClass:[NSString class]] ? cfg[@"key"]    : @"";
     self.api    = api.length    ? api    : ps[0][@"api"];
     self.model  = model.length  ? model  : ps[0][@"model"];
     self.model2 = mod2.length   ? mod2   : (ps[0][@"model2"] ?: @"");
+    self.model3 = mod3.length   ? mod3   : (ps[0][@"model3"] ?: @"");
     self.keyF.text = key;
 
     // 选中当前 api 对应的预设按钮
@@ -851,10 +861,14 @@ static void aaTestConnection(NSString *api, NSString *model, NSString *key,
                 @"1 个（…%@）", [ks[0] substringFromIndex:(NSUInteger)MAX(0, (int)[ks[0] length] - 6)]];
     else                    kd = [NSString stringWithFormat:
                 @"%lu 个（自动轮换，被限流会换下一个）", (unsigned long)ks.count];
+    NSMutableArray *chain = [NSMutableArray array];
+    if (self.model.length)  [chain addObject:self.model];
+    if (self.model2.length) [chain addObject:self.model2];
+    if (self.model3.length) [chain addObject:self.model3];
     self.infoL.text = [NSString stringWithFormat:
-        @"渠道：%@\n主模型：%@\n备用模型：%@\nKey：%@\n超时：6s（按页面剩余时间自动收紧）",
-        self.api, self.model,
-        self.model2.length ? self.model2 : @"（无）", kd];
+        @"渠道：%@\n模型（先准后快依次兜底）：%@%@\nKey：%@\n超时：6s（按页面剩余时间自动收紧）",
+        self.api, [chain componentsJoinedByString:@" → "],
+        chain.count <= 1 ? @"\n（未配置备用模型）" : @"", kd];
 }
 
 - (void)preset:(UIButton *)b {
@@ -862,6 +876,7 @@ static void aaTestConnection(NSString *api, NSString *model, NSString *key,
     self.api = p[@"api"];
     self.model = p[@"model"];
     self.model2 = p[@"model2"] ?: @"";
+    self.model3 = p[@"model3"] ?: @"";
     [self markPreset:b.tag];
     [self refreshInfo];
 }
@@ -892,6 +907,7 @@ static void aaTestConnection(NSString *api, NSString *model, NSString *key,
     cfg[@"api"]     = self.api;
     cfg[@"model"]   = self.model;
     if (self.model2.length) cfg[@"model2"] = self.model2;
+    if (self.model3.length) cfg[@"model3"] = self.model3;
     cfg[@"key"]     = ks.firstObject;
     if (ks.count > 1) cfg[@"keys"] = ks;
     cfg[@"timeout"] = @6.0;
@@ -1149,6 +1165,22 @@ static NSArray *aaSplitAnswers(NSString *ans, NSArray *opts) {
     return out;
 }
 
+// ---- 从题干解析多选要选几个：「哪三款 / 哪三个 / 3种 / 两项」→ N；解析不出返回 0 ----
+static int aaMultiCount(NSString *q) {
+    @try {
+        if (q.length == 0) return 0;
+        NSDictionary *cn = @{@"一": @1, @"两": @2, @"二": @2, @"三": @3, @"四": @4, @"五": @5};
+        NSArray *units = @[@"款", @"个", @"种", @"项", @"样"];
+        for (NSString *u in units)
+            for (int d = 2; d <= 5; d++)
+                if ([q containsString:[NSString stringWithFormat:@"%d%@", d, u]]) return d;
+        for (NSString *u in units)
+            for (NSString *k in cn)
+                if ([q containsString:[k stringByAppendingString:u]]) return [cn[k] intValue];
+    } @catch (NSException *e) {}
+    return 0;
+}
+
 // ---- 无 AI 时的启发式兜底：不联网、不要题库，比纯随机命中率高一点 ----
 // ① 「以上都对 / 以上都是」家族 → 直接选它
 // ② 一长三短：最长项明显长于其余 → 选最长
@@ -1297,36 +1329,60 @@ static void askAIWithKey(NSString *question, NSArray *opts, NSDictionary *cfg, B
     }
 }
 
-// ---- 双模型接力：主模型准但慢（glm-4.6 约 2.6~4.7s），备用模型快但差些（glm-4.5-air 约 0.5s）。
-//      两个同时发出去跑；主模型一回来就用主模型的；主模型没赶上预算、或失败了，才用备用的；
-//      都没有才轮到随机。备用结果先攥在手里不提交，绝不因为"快的先回来"就把准的扔了。
+// ---- 多模型接力：按优先级同时发出（主=准但慢，备=快，免费兜底=慢但真免费）。
+//      主模型一有答案就立刻用它；主模型失败了，才按顺序用已回来的备用答案；
+//      都没有就等预算到点，从已有结果里按优先级挑，再没有才随机。
+//      快的先回来绝不提前提交，攥着等准的。
 static void askAIDual(NSString *question, NSArray *opts, NSDictionary *cfg, BOOL isMulti,
                       double budget, void (^cb)(NSString *)) {
-    NSString *m1 = [cfg[@"model"]  isKindOfClass:[NSString class]] ? cfg[@"model"]  : @"";
-    NSString *m2 = [cfg[@"model2"] isKindOfClass:[NSString class]] ? cfg[@"model2"] : @"";
-    if (m2.length == 0 || [m2 isEqualToString:m1]) {
+    NSMutableArray<NSString *> *models = [NSMutableArray array];
+    for (NSString *k in @[@"model", @"model2", @"model3"]) {
+        NSString *mm = [cfg[k] isKindOfClass:[NSString class]] ? cfg[k] : @"";
+        if (mm.length && ![models containsObject:mm]) [models addObject:mm];
+    }
+    if (models.count <= 1) {
         askAI(question, opts, cfg, isMulti, cb);   // 没配备用模型就单发主模型
         return;
     }
     @try {
-        NSMutableDictionary *c1  = [cfg mutableCopy]; c1[@"model"]  = m1;
-        NSMutableDictionary *c2b = [cfg mutableCopy]; c2b[@"model"] = m2;
+        NSString *prim = models.firstObject;
+        NSMutableArray *rest = [models mutableCopy];
+        [rest removeObjectAtIndex:0];
         __block BOOL done = NO;
-        __block BOOL primDone = NO, bkDone = NO;
-        __block NSString *primAns = nil, *bkAns = nil;
+        __block BOOL primDone = NO;
+        __block NSString *primAns = nil;
+        __block NSMutableDictionary *restAns = [NSMutableDictionary dictionary];
         void (^resolve)(void) = ^{
-            if (done) return;
-            if (primDone && primAns.length) { done = YES; cb(primAns); return; }
-            if (primDone && bkDone) { done = YES; cb(bkAns.length ? bkAns : nil); return; }
+            if (done || !primDone) return;
+            if (primAns.length) { done = YES; cb(primAns); return; }
+            for (NSString *k in rest) {            // 主模型失败 → 按优先级用已回来的备用答案
+                NSString *a = restAns[k];
+                if ([a isKindOfClass:[NSString class]] && a.length) { done = YES; cb(a); return; }
+            }
         };
-        aaLog(@"[AI] 双模型接力：主 %@（准）+ 备 %@（快）｜预算 %.1fs", m1, m2, budget);
-        askAI(question, opts, c1,  isMulti, ^(NSString *a){ primDone = YES; primAns = a; resolve(); });
-        askAI(question, opts, c2b, isMulti, ^(NSString *a){ if (done) return; bkDone = YES; bkAns = a; resolve(); });
+        aaLog(@"[AI] 多模型接力（优先级高→低）：%@\n预算 %.1fs",
+              [models componentsJoinedByString:@" → "], budget);
+        for (NSString *mm in models) {
+            NSMutableDictionary *c = [cfg mutableCopy];
+            c[@"model"] = mm;
+            BOOL isPrim = [mm isEqualToString:prim];
+            askAI(question, opts, c, isMulti, ^(NSString *a){
+                if (isPrim) { primDone = YES; primAns = a; resolve(); return; }
+                if (done) return;
+                restAns[mm] = a ?: @"";
+                resolve();
+            });
+        }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(budget * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (done) return;
             done = YES;
-            NSString *a = primAns.length ? primAns : (bkAns.length ? bkAns : nil);
+            NSString *a = primAns.length ? primAns : nil;
+            if (!a.length)
+                for (NSString *k in rest) {
+                    NSString *x = restAns[k];
+                    if ([x isKindOfClass:[NSString class]] && x.length) { a = x; break; }
+                }
             aaLog(@"[AI] %.1fs 预算到点 → %@", budget, a.length ? @"采用已有结果" : @"没有结果，随机兜底");
             cb(a);
         });
@@ -1658,12 +1714,24 @@ static void tryWebViewQuiz(void) {
                         isMulti = YES;
                     if (isMulti) aaLog(@"[H5] 判定为多选题（DOM 徽标/题干关键词）");
 
-                    // 兜底：读不到选项 / 没配 key → 直接随机点，绝不空过
+                    // 兜底：读不到选项 / 没配 key / AI 超时 → 绝不空过
                     void (^justRandom)(NSString *) = ^(NSString *why){
                         if (isMulti) {
-                            // 多选题：拿不准就全选（多选至少要 2 个，只点 1 个必错）
-                            NSString *all = [opts componentsJoinedByString:@"|"];
-                            aaLog(@"[H5] %@ → 多选题兜底全选 %lu 项", why, (unsigned long)opts.count);
+                            // 多选：题干写「哪三款」就选 3 个（全选 4 个必错，只选 1 个也必错）；
+                            // 题干没写数量才全选
+                            int want = aaMultiCount(q);
+                            NSString *all;
+                            if (want >= 2 && opts.count > (NSUInteger)want) {
+                                NSMutableArray *cp = [opts mutableCopy];
+                                while (cp.count > (NSUInteger)want)
+                                    [cp removeObjectAtIndex:arc4random_uniform((uint32_t)cp.count)];
+                                all = [cp componentsJoinedByString:@"|"];
+                                aaLog(@"[H5] %@ → 多选题兜底：题干要 %d 个，共 %lu 项 → 随机选 %d 个：%@",
+                                      why, want, (unsigned long)opts.count, want, all);
+                            } else {
+                                all = [opts componentsJoinedByString:@"|"];
+                                aaLog(@"[H5] %@ → 多选题兜底全选 %lu 项", why, (unsigned long)opts.count);
+                            }
                             answerAndSubmit(wv, all, q);
                             return;
                         }
@@ -1724,7 +1792,28 @@ static void tryWebViewQuiz(void) {
                         done = YES;
                         if (ans.length) {
                             // AI 可能一次给多个答案（空格或 | 分隔），拆开再用 | 拼给 JS
-                            NSArray *parts = aaSplitAnswers(ans, opts);
+                            NSMutableArray *parts = [[aaSplitAnswers(ans, opts) mutableCopy] ?: [NSMutableArray array]];
+                            // 多选数量校准：题干要 N 个 → AI 给多了砍到 N，给少了从没选中的随机补到 N
+                            if (isMulti && parts.count > 0) {
+                                int want = aaMultiCount(q);
+                                if (want >= 2 && (NSUInteger)want != parts.count) {
+                                    if (parts.count > (NSUInteger)want) {
+                                        [parts removeObjectsInRange:NSMakeRange((NSUInteger)want, parts.count - (NSUInteger)want)];
+                                        aaLog(@"[AI] 多选要 %d 个，AI 给了 %lu 个 → 砍到 %d 个", want, (unsigned long)parts.count, want);
+                                    } else {
+                                        NSMutableArray *rest = [NSMutableArray array];
+                                        for (NSString *o in opts)
+                                            if (![parts containsObject:o]) [rest addObject:o];
+                                        while ((NSUInteger)want > parts.count && rest.count) {
+                                            NSUInteger k = arc4random_uniform((uint32_t)rest.count);
+                                            [parts addObject:rest[k]];
+                                            [rest removeObjectAtIndex:k];
+                                        }
+                                        aaLog(@"[AI] 多选要 %d 个，AI 只给 %lu 个 → 随机补齐到 %d 个",
+                                              want, (unsigned long)parts.count, want);
+                                    }
+                                }
+                            }
                             NSString *joined = [parts componentsJoinedByString:@"|"];
                             if (isMulti && parts.count < 2)
                                 aaLog(@"[AI] 多选题但只返回 %lu 个答案（可能不准）", (unsigned long)parts.count);
@@ -1733,7 +1822,7 @@ static void tryWebViewQuiz(void) {
                             aaLog(@"[缓存] 已记住本题，下次遇到直接秒答");
                             answerAndSubmit(wv, joined, q);
                         } else {
-                            answerAndSubmit(wv, nil, q);
+                            justRandom(@"AI 没给出答案");   // 多选会选 N 个/全选，单选走启发式，绝不空提交
                         }
                     };
                     askAIDual(q, opts, cfg, isMulti, budget, ^(NSString *ans){ finish(ans); });
