@@ -861,20 +861,30 @@ static NSString *aaQuizJS(BOOL doClick, NSString *answer) {
         "var cand=[];"
         "all.forEach(function(e){var t=txt(e);if(t&&t.length<=80)cand.push({e:e,t:t});});"
         "var qi=-1,qt='';"
-        "cand.forEach(function(c,i){if((c.t.indexOf('？')>=0||c.t.indexOf('?')>=0)&&c.t.length>qt.length){qt=c.t;qi=i;}});"
+        "cand.forEach(function(c,i){var t=c.t;"
+        " if(!(t.indexOf('？')>=0||t.indexOf('?')>=0))return;"
+        " if(t.indexOf('\\n')>=0)return;"
+        " if(t.length>70)return;"
+        " if(t.length>qt.length){qt=t;qi=i;}});"
         "var si=-1;"
         "cand.forEach(function(c,i){if(si<0&&/^(确认提交|提交答案|提交)$/.test(c.t))si=i;});"
         "if(si<0)return JSON.stringify({err:'no-submit'});"
-        "var start=qi>=0?qi+1:0,opts=[],seen={};"
-        "for(var i=si-1;i>=start;i--){var t=cand[i].t;"
-        " if(!t||t.length>30)continue;"
-        " if(t.indexOf('\\n')>=0)continue;"
-        " if(/^\\d+\\s*s$/.test(t))continue;"
-        " if(/规则|剩余|答题时间|倒计时|关闭|取消|返回|首页|我知道|提交|多选|单选/.test(t))continue;"
-        " if(qt&&(t===qt||t.indexOf(qt)>=0||(qt.indexOf(t)>=0&&t.length>=4)))continue;"
-        " if(seen[t])continue;"
-        " seen[t]=1;opts.push(cand[i]);}"
-        "opts.reverse();"
+        "var start=qi>=0?qi+1:0;"
+        "function mk(strict,from){"
+        " var arr=[],seen={};"
+        " for(var i=si-1;i>=from;i--){var t=cand[i].t;"
+        "  if(!t||t.length>30)continue;"
+        "  if(t.indexOf('\\n')>=0)continue;"
+        "  if(t.indexOf('？')>=0||t.indexOf('?')>=0)continue;"
+        "  if(/^\\d+\\s*s$/.test(t))continue;"
+        "  if(/规则|剩余|答题时间|倒计时|关闭|取消|返回|首页|我知道|提交|多选|单选/.test(t))continue;"
+        "  if(strict&&qt&&qt.length&&(t===qt||t.indexOf(qt)>=0))continue;"
+        "  if(seen[t])continue;"
+        "  seen[t]=1;arr.push(cand[i]);}"
+        " arr.reverse();return arr;}"
+        "var opts=mk(true,start);"
+        "if(!opts.length)opts=mk(false,start);"
+        "if(!opts.length)opts=mk(false,0);"
         "var names=opts.map(function(o){return o.t;});"
         "var multi=false;"
         "all.forEach(function(e){if(multi)return;var t=txt(e);"
@@ -984,6 +994,18 @@ static void answerAndSubmit(WKWebView *wv, NSString *answer, NSString *qkey) {
     double wait = 0.45 + 0.20 * (double)((nAns > 1) ? (nAns - 1) : 0);
     webViewRunJS(wv, aaQuizJS(YES, answer), ^(NSString *r){
         aaLog(@"[H5] 选项点击结果：%@", r ? r : @"无返回");
+        // 一个选项都没点上就别提交了：空提交必定答错，还不如不动
+        NSInteger cc = -1;
+        if (r) {
+            id j = [NSJSONSerialization JSONObjectWithData:[r dataUsingEncoding:NSUTF8StringEncoding]
+                                                   options:0 error:nil];
+            if ([j isKindOfClass:[NSDictionary class]] && [j[@"clicked"] isKindOfClass:[NSArray class]])
+                cc = (NSInteger)[(NSArray *)j[@"clicked"] count];
+        }
+        if (cc == 0) {
+            aaLog(@"[H5] 一个选项都没点上 → 放弃提交（空提交必错）");
+            return;
+        }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             webViewRunJS(wv, aaSubmitJS(0), ^(NSString *r2){
