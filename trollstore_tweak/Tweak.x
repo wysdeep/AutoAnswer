@@ -89,6 +89,9 @@ static void openConfigPanel(void);
 static void closeConfigPanel(void);
 static NSDictionary *loadAIConfig(void);
 static NSArray<NSString *> *aaKeysFromConfig(NSDictionary *cfg);
+static NSString *aaConfigPath(void);
+static void aaSaveBallPos(double x, double y);
+static CGPoint aaBallPos(void);
 
 // ---------------- 悬浮开关按钮 ----------------
 @interface AutoAnswerBundle : NSObject @end
