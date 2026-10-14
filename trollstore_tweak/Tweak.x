@@ -113,6 +113,29 @@ static NSArray<NSString *> *aaKeysFromConfig(NSDictionary *cfg);
         openConfigPanel();
     }
 }
+// 拖动悬浮球：位移超过 8pt 算拖动（松手记住位置），否则仍按「点一下开关」处理
++ (void)ballPanned:(UIPanGestureRecognizer *)g {
+    UIWindow *w = gOverlay;
+    if (!w) return;
+    static CGPoint sCenter;
+    static BOOL moved = NO;
+    CGPoint t = [g translationInView:w];
+    if (g.state == UIGestureRecognizerStateBegan) {
+        sCenter = w.center;
+        moved = NO;
+    } else if (g.state == UIGestureRecognizerStateChanged) {
+        CGPoint c = sCenter;
+        c.x += t.x; c.y += t.y;
+        CGRect sb = [UIScreen mainScreen].bounds;
+        if (c.x < 31) c.x = 31; if (c.x > sb.size.width  - 31) c.x = sb.size.width  - 31;
+        if (c.y < 31) c.y = 31; if (c.y > sb.size.height - 31) c.y = sb.size.height - 31;
+        w.center = c;
+        if (fabs(t.x) > 8 || fabs(t.y) > 8) moved = YES;
+    } else if (g.state == UIGestureRecognizerStateEnded ||
+               g.state == UIGestureRecognizerStateCancelled) {
+        if (moved) aaSaveBallPos(w.center.x, w.center.y);
+    }
+}
 @end
 
 static void updateToggleUI(void) {
@@ -128,8 +151,9 @@ static void updateToggleUI(void) {
 
 static void createOverlay(UIWindowScene *scene) {
     if (gOverlay || !scene) return;
+    CGPoint bc = aaBallPos();
     UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
-    w.frame = CGRectMake(15, 200, 62, 62);
+    w.frame = CGRectMake(bc.x - 31, bc.y - 31, 62, 62);
     w.windowLevel = UIWindowLevelAlert + 100;
     w.backgroundColor = [UIColor clearColor];
     w.hidden = NO;
@@ -149,6 +173,11 @@ forControlEvents:UIControlEventTouchUpInside];
                                                       action:@selector(longPressed:)];
     lp.minimumPressDuration = 0.6;   // 长按 0.6s 打开设置面板（短按仍然是开/关）
     [b addGestureRecognizer:lp];
+    UIPanGestureRecognizer *pan =
+        [[UIPanGestureRecognizer alloc] initWithTarget:[AutoAnswerBundle class]
+                                                action:@selector(ballPanned:)];
+    pan.maximumNumberOfTouches = 1;  // 拖动悬浮球（移动超过 8pt 才算拖动，否则仍是点按开关）
+    [b addGestureRecognizer:pan];
     [w addSubview:b];
 
     gOverlay = w;
@@ -507,6 +536,37 @@ static void webViewRunJS(WKWebView *wv, NSString *js, void (^cb)(NSString *)) {
 static NSString *aaConfigPath(void) {
     NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     return [docs.firstObject stringByAppendingPathComponent:@"AutoAnswer_config.json"];
+}
+// 悬浮球位置记忆（ballX / ballY，中心点坐标）
+static void aaSaveBallPos(double x, double y) {
+    NSMutableDictionary *m = nil;
+    NSData *d = [NSData dataWithContentsOfFile:aaConfigPath()];
+    if (d) {
+        id o = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if ([o isKindOfClass:[NSDictionary class]]) m = [o mutableCopy];
+    }
+    if (!m) m = [NSMutableDictionary dictionary];
+    m[@"ballX"] = @((int)round(x));
+    m[@"ballY"] = @((int)round(y));
+    NSData *nd = [NSJSONSerialization dataWithJSONObject:m options:NSJSONWritingPrettyPrinted error:nil];
+    if (nd) [nd writeToFile:aaConfigPath() atomically:YES];
+    aaLog(@"悬浮球位置已记住：(%.0f, %.0f)", x, y);
+}
+static CGPoint aaBallPos(void) {
+    NSData *d = [NSData dataWithContentsOfFile:aaConfigPath()];
+    CGPoint def = CGPointMake(46, 231);          // 默认中心（原位置 15,200 + 半径31）
+    if (!d) return def;
+    id o = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+    if (![o isKindOfClass:[NSDictionary class]]) return def;
+    NSDictionary *m = o;
+    id bx = m[@"ballX"], by = m[@"ballY"];
+    if (![bx respondsToSelector:@selector(doubleValue)] || ![by respondsToSelector:@selector(doubleValue)])
+        return def;
+    CGRect sb = [UIScreen mainScreen].bounds;
+    double x = [bx doubleValue], y = [by doubleValue];
+    if (x < 31) x = 31; if (x > sb.size.width  - 31) x = sb.size.width  - 31;
+    if (y < 31) y = 31; if (y > sb.size.height - 31) y = sb.size.height - 31;
+    return CGPointMake(x, y);
 }
 static NSDictionary *loadAIConfig(void) {
     NSData *d = [NSData dataWithContentsOfFile:aaConfigPath()];
