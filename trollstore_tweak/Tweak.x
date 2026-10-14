@@ -42,7 +42,8 @@ static NSArray<NSString *> *allAboveMarkers(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         m = @[@"以上都是", @"以上都对", @"以上都选", @"以上全选",
-              @"以上全对", @"以上全部", @"全部都对", @"全部都是", @"全部都选"];
+              @"以上全对", @"以上全部", @"以上都有",
+              @"全部都对", @"全部都是", @"全部都选", @"全部都有", @"全都对", @"全都有"];
     });
     return m;
 }
@@ -1206,19 +1207,186 @@ static int aaMultiCount(NSString *q) {
     return 0;
 }
 
-// ---- 无 AI 时的启发式兜底：不联网、不要题库，比纯随机命中率高一点 ----
-// ① 「以上都对 / 以上都是」家族 → 直接选它
-// ② 一长三短：最长项明显长于其余 → 选最长
-static NSString *aaHeuristicAnswer(NSArray *opts) {
+// 以上都对家族（含「以上都有 / 全部都有 / 另外三个都正确」这类变体）
+static BOOL aaIsAllAbove(NSString *t) {
+    if (![t isKindOfClass:[NSString class]] || t.length == 0) return NO;
+    for (NSString *mk in allAboveMarkers())
+        if ([t containsString:mk]) return YES;
+    if (([t containsString:@"另外"] || [t containsString:@"其余"] || [t containsString:@"其他"]) &&
+        ([t containsString:@"都正确"] || [t containsString:@"都对"] || [t containsString:@"都选"]))
+        return YES;
+    return NO;
+}
+
+// 从题干判断是不是多选题（规则：多选/哪些/哪几/包括/包含/都有/哪两/哪三/哪四/哪2/哪3/哪4）
+static BOOL aaQuestionIsMulti(NSString *q) {
+    if (![q isKindOfClass:[NSString class]] || q.length == 0) return NO;
+    if ([q containsString:@"多选"]) return YES;
+    NSArray *mk = @[@"哪些", @"哪几", @"哪两", @"哪三", @"哪四",
+                    @"哪2", @"哪3", @"哪4", @"包括", @"包含"];
+    for (NSString *m in mk) if ([q containsString:m]) return YES;
+    if (aaMultiCount(q) >= 2) return YES;
+    // 「都有」只在这题明显不是单选时才算多选（「以下哪款…都有」是单选，别误判）
+    if ([q containsString:@"都有"] &&
+        !([q containsString:@"哪款"] || [q containsString:@"哪个"] ||
+          [q containsString:@"哪一款"] || [q containsString:@"哪一个"])) return YES;
+    return NO;
+}
+
+// 选项要不要排除：绝对化措辞（一定/肯定/…）+ 「以上都不对/不确定/其它」类
+static BOOL aaBadOption(NSString *t) {
+    if (![t isKindOfClass:[NSString class]] || t.length == 0) return NO;
+    if (aaIsAllAbove(t)) return NO;                 // 以上都对家族是例外，不排
+    NSArray *abs = @[@"一定", @"肯定", @"绝对", @"必须", @"全都", @"从不",
+                     @"永远", @"必然", @"毫无疑问", @"不可能", @"所有"];
+    for (NSString *m in abs) if ([t containsString:m]) return YES;
+    NSArray *neg = @[@"以上都不", @"以上都错", @"都不对", @"都不正确",
+                     @"不确定", @"不知道", @"以上都不是"];
+    for (NSString *m in neg) if ([t containsString:m]) return YES;
+    return NO;
+}
+
+// 数字匹配：题干里只有一个数字（含中文数字 三→3、两→2）时，选数字对得上的那个选项
+static NSString *aaNumberMatch(NSString *q, NSArray *opts) {
     @try {
-        if (!opts || opts.count < 2) return nil;
+        if (q.length == 0 || opts.count < 2) return nil;
+        NSDictionary *cn = @{@"一": @1, @"两": @2, @"二": @2, @"三": @3, @"四": @4,
+                             @"五": @5, @"六": @6, @"七": @7, @"八": @8, @"九": @9, @"十": @10};
+        NSMutableArray *qNums = [NSMutableArray array];
+        // 阿拉伯数字
+        NSMutableString *cur = [NSMutableString string];
+        for (NSUInteger i = 0; i < q.length; i++) {
+            unichar c = [q characterAtIndex:i];
+            if (c >= '0' && c <= '9') [cur appendFormat:@"%C", c];
+            else { if (cur.length) { [qNums addObject:@([cur intValue])]; cur = [NSMutableString string]; } }
+        }
+        if (cur.length) [qNums addObject:@([cur intValue])];
+        // 中文数字
+        for (NSString *k in cn) if ([q containsString:k]) [qNums addObject:cn[k]];
+        if (qNums.count == 0) return nil;
+        // 题干数字不唯一就不猜（避免歧义）
+        NSSet *uniq = [NSSet setWithArray:qNums];
+        if (uniq.count != 1) return nil;
+        int want = [qNums.firstObject intValue];
+        if (want < 1) return nil;                       // 0 之类的别猜，容易误中
+        NSMutableArray *hit = [NSMutableArray array];
         for (id o in opts) {
             if (![o isKindOfClass:[NSString class]]) continue;
             NSString *t = (NSString *)o;
-            for (NSString *mk in allAboveMarkers())
-                if ([t containsString:mk]) { aaLog(@"[启发] 命中「以上都对」家族 → %@", t); return t; }
+            if (![t isKindOfClass:[NSString class]]) continue;
+            NSNumber *n = @([t intValue]);
+            if ([n intValue] == want) { [hit addObject:t]; continue; }
+            for (NSString *k in cn)
+                if ([t containsString:k] && [cn[k] intValue] == want) { [hit addObject:t]; break; }
         }
-        NSArray *sorted = [opts sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b){
+        if (hit.count == 1) {
+            aaLog(@"[启发] 数字匹配：题干数字 %d → %@", want, hit[0]);
+            return hit[0];
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+// 时间题：直播间一般 20:00
+static NSString *aaTimeMatch(NSString *q, NSArray *opts) {
+    @try {
+        if (q.length == 0) return nil;
+        BOOL isTime = [q containsString:@"时间"] || [q containsString:@"几点"] ||
+                      [q containsString:@"什么时候"] || [q containsString:@"开播"] ||
+                      [q containsString:@"开抢"] || [q containsString:@"开售"] ||
+                      [q containsString:@"开始"];
+        if (!isTime) return nil;
+        // ① 直播间默认 20:00（也认「晚上8点 / 晚8点 / 20点」）
+        for (id o in opts) {
+            if (![o isKindOfClass:[NSString class]]) continue;
+            NSString *t = (NSString *)o;
+            if ([t containsString:@"20:00"] || [t containsString:@"20点"] ||
+                [t containsString:@"晚上8点"] || [t containsString:@"晚8点"] ||
+                [t containsString:@"晚上八点"]) {
+                aaLog(@"[启发] 时间题 → 选 20:00：%@", t);
+                return t;
+            }
+        }
+        // ② 没有 20:00 就选最晚的那个整点（晚场概率更高）
+        NSString *best = nil; int bestH = -1;
+        for (id o in opts) {
+            if (![o isKindOfClass:[NSString class]]) continue;
+            NSString *t = (NSString *)o;
+            NSRange r = [t rangeOfString:@"(\\d{1,2})[:：点]" options:NSRegularExpressionSearch];
+            if (r.location == NSNotFound) continue;
+            NSRange g = [t rangeOfString:@"\\d{1,2}" options:NSRegularExpressionSearch];
+            if (g.location == NSNotFound) continue;
+            int h = [[t substringWithRange:g] intValue];
+            if (h < 12) h += 12;                    // 「8点」按晚上 8 点算
+            if (h > bestH) { bestH = h; best = t; }
+        }
+        if (best.length) {
+            aaLog(@"[启发] 时间题（没有 20:00）→ 选最晚的：%@", best);
+            return best;
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+// SPF 题：一般答案是 SPF50
+static NSString *aaSpfMatch(NSString *q, NSArray *opts) {
+    @try {
+        NSString *up = [q uppercaseString];
+        if (!([up containsString:@"SPF"] || [q containsString:@"防晒"])) return nil;
+        for (id o in opts) {
+            if (![o isKindOfClass:[NSString class]]) continue;
+            if ([[(NSString *)o uppercaseString] containsString:@"SPF50"]) {
+                aaLog(@"[启发] SPF 题 → 选 SPF50：%@", o);
+                return (NSString *)o;
+            }
+        }
+        // 退一步：题干明确写了 SPF，就选含 50 的
+        if ([up containsString:@"SPF"]) {
+            for (id o in opts) {
+                if (![o isKindOfClass:[NSString class]]) continue;
+                NSString *t = (NSString *)o;
+                if ([t containsString:@"50"] && ![t containsString:@"500"]) {
+                    aaLog(@"[启发] SPF 题 → 选含 50 的：%@", t);
+                    return t;
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+// ---- 无 AI 时的启发式兜底（不联网），命中顺序即优先级 ----
+// ① 「以上都对 / 以上都有 / 另外三个都正确」家族 → 直接选它
+// ② SPF 题 → SPF50
+// ③ 题干数字 → 选项数字对得上
+// ④ 时间题 → 20:00
+// ⑤ 排除「一定/肯定/以上都不对」类后，一长三短 → 选最长
+// ⑥ 题干关键词重合度最高的那个（必须严格最高才用）
+static NSString *aaHeuristicAnswer(NSString *q, NSArray *opts) {
+    @try {
+        if (!opts || opts.count < 2) return nil;
+        // ① 以上都对家族
+        for (id o in opts) {
+            if (![o isKindOfClass:[NSString class]]) continue;
+            if (aaIsAllAbove((NSString *)o)) {
+                aaLog(@"[启发] 命中「以上都对/都有」家族 → %@", o);
+                return (NSString *)o;
+            }
+        }
+        // ② SPF
+        NSString *spf = aaSpfMatch(q, opts);   if (spf.length) return spf;
+        // ③ 数字
+        NSString *num = aaNumberMatch(q, opts); if (num.length) return num;
+        // ④ 时间
+        NSString *tm  = aaTimeMatch(q, opts);   if (tm.length)  return tm;
+
+        // ⑤ 过滤掉绝对化/否定类选项
+        NSMutableArray *pool = [NSMutableArray array];
+        for (id o in opts)
+            if ([o isKindOfClass:[NSString class]] && !aaBadOption((NSString *)o)) [pool addObject:o];
+        if (pool.count == 0) pool = [opts mutableCopy];
+
+        NSArray *sorted = [pool sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b){
             if (a.length > b.length) return NSOrderedAscending;
             if (a.length < b.length) return NSOrderedDescending;
             return NSOrderedSame;
@@ -1229,6 +1397,23 @@ static NSString *aaHeuristicAnswer(NSArray *opts) {
             aaLog(@"[启发] 一长三短（最长 %lu 字 vs 次长 %lu 字）→ %@",
                   (unsigned long)longest.length, (unsigned long)second.length, longest);
             return longest;
+        }
+        // ⑥ 题干关键词重合度（严格最高才采用，平手就放弃交给随机）
+        if (q.length >= 4) {
+            NSInteger bestScore = -1, bestCnt = 0; NSString *best = nil;
+            for (NSString *o in pool) {
+                NSInteger sc = 0;
+                for (NSUInteger i = 0; i + 2 <= o.length; i++) {
+                    NSString *g = [o substringWithRange:NSMakeRange(i, 2)];
+                    if ([q containsString:g]) sc++;
+                }
+                if (sc > bestScore) { bestScore = sc; bestCnt = 1; best = o; }
+                else if (sc == bestScore) { bestCnt++; }
+            }
+            if (best && bestCnt == 1 && bestScore > 0) {
+                aaLog(@"[启发] 题干关键词重合最高（得分 %ld）→ %@", (long)bestScore, best);
+                return best;
+            }
         }
     } @catch (NSException *e) {}
     return nil;
@@ -1718,10 +1903,7 @@ static void tryWebViewQuiz(void) {
                             isMulti = [j[@"multi"] boolValue];
                         }
                     }
-                    if (!isMulti && ([q containsString:@"多选"] ||
-                                     [q containsString:@"哪些"] || [q containsString:@"哪两个"] ||
-                                     [q containsString:@"哪三个"] || [q containsString:@"哪四个"]))
-                        isMulti = YES;
+                    if (!isMulti && aaQuestionIsMulti(q)) isMulti = YES;
                     if (isMulti) aaLog(@"[H5] 判定为多选题（DOM 徽标/题干关键词）");
 
                     // 兜底：读不到选项 / 没配 key / AI 超时 → 绝不空过
@@ -1730,22 +1912,25 @@ static void tryWebViewQuiz(void) {
                             // 多选：题干写「哪三款」就选 3 个（全选 4 个必错，只选 1 个也必错）；
                             // 题干没写数量才全选
                             int want = aaMultiCount(q);
+                            // 题干写了「哪三款/哪3个」→ 就选 3 个；没写数量（包括/哪几/只有多选徽标）
+                            // → 在 2~全部 之间随机取个数。数学上随机个数比「一律全选」命中率高很多：
+                            // 4 选多时全选只有 1/11 正确率，随机个数约 47%。
+                            if (want < 2) want = 2 + (int)arc4random_uniform((uint32_t)MAX(1, (int)opts.count - 1));
                             NSString *all;
-                            if (want >= 2 && opts.count > (NSUInteger)want) {
+                            if (opts.count > (NSUInteger)want) {
                                 NSMutableArray *cp = [opts mutableCopy];
                                 while (cp.count > (NSUInteger)want)
                                     [cp removeObjectAtIndex:arc4random_uniform((uint32_t)cp.count)];
                                 all = [cp componentsJoinedByString:@"|"];
-                                aaLog(@"[H5] %@ → 多选题兜底：题干要 %d 个，共 %lu 项 → 随机选 %d 个：%@",
-                                      why, want, (unsigned long)opts.count, want, all);
                             } else {
                                 all = [opts componentsJoinedByString:@"|"];
-                                aaLog(@"[H5] %@ → 多选题兜底全选 %lu 项", why, (unsigned long)opts.count);
                             }
+                            aaLog(@"[H5] %@ → 多选题兜底：共 %lu 项，随机选 %d 个 → %@",
+                                  why, (unsigned long)opts.count, want, all);
                             answerAndSubmit(wv, all, q);
                             return;
                         }
-                        NSString *h = aaHeuristicAnswer(opts);
+                        NSString *h = aaHeuristicAnswer(q, opts);
                         if (h.length) {
                             aaLog(@"[H5] %@ → 走启发式（非纯随机）", why);
                             answerAndSubmit(wv, h, q);
